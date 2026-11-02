@@ -1,0 +1,401 @@
+"""
+Anticipation Signals v12.8 - Señales ANTICIPATIVAS de dirección y amplitud
+
+Todas las señales nuevas miden el PRESENTE (el movimiento que ya ocurrió) y por
+eso llegan tarde. Estas detectan la INTENCIÓN antes de que el precio se mueva:
+
+  DIRECCIÓN (se disparan ANTES del desplazamiento):
+   1. book_slope        Pendiente del libro (presión acumulada cerca/fuera del mid)
+   2. wall_momentum     Muros que AUMENTAN en el lado del movimiento (combustible)
+   3. ofi_weighted      OFI ponderado por nivel: adds/cancels near-touch vs deep
+   4. micro_price_dev   Desvío del precio virtual (mid ponderado por volumen) vs last
+                        -> el punto de equilibrio real YA se movió; el último trade no
+   5. cvd_divergence    CVD vs precio: absorción anticipativa (compran y NO sube =>
+                        breakout alcista inminente, y viceversa)
+   6. trade_arrival     Racha de agresores un lado con ticks quietos = iceberg being
+                        eaten -> continuación inminente
+
+  AMPLITUD (potencial de movimiento, sin sesgo direccional):
+   7. liquidity_thinning Vaciamiento simultáneo de ambos lados del libro
+                        -> suelo/resumen fino = cualquier flush recorre muchos ticks
+   8. spread_compression Compresión del spread + apilado de tamaño = coiling pre-breakout
+   9. volume_accel      Primera derivada del volumen (aceleración), no el nivel:
+                        el flujo se acelera ANTES de que el spike sea visible
+
+Convención: normalized en [-1, 1] para direccionales; [0, 1] para amplitud.
+Las amplitúdicas emiten también direction_hint en metadata (long/short/neutral)
+para que el motor pueda usar el lado "delgado" como confirmación direccional.
+"""
+import time
+from collections import deque
+from typing import Dict, List, Tuple
+
+from models import Direction, Signal
+from orderbook import SimpleOBM
+from signals.utils import dir_from
+
+
+# ---------------------------------------------------------------- helpers
+def _sides(book: SimpleOBM, levels: int) -> Tuple[List, List]:
+    bids, asks = book.get_clean_book(levels)
+    return bids, asks
+
+
+# ================================================================ DIRECCIÓN
+
+# 1. Book Slope / presión posicional
+class BookSlope:
+    """Compara el volumen 'cerca del touch' con el volumen 'profundo' en cada lado.
+
+    Si los bids se apilan CERCA del mid mientras las asks se apilan LEJOS, los
+    compradores tienen respaldo inmediato y los vendedores no: desequilibrio
+    LATENTE que suele resolverse al alza antes de que el precio lo refleje.
+    """
+
+    def __init__(self, near_levels: int = 5, far_levels: int = 20):
+        self.near = near_levels
+        self.far = far_levels
+
+    def calculate(self, book: SimpleOBM) -> Signal:
+        bids, asks = _sides(book, self.far)
+        if len(bids) < self.near or len(asks) < self.near:
+            return Signal("book_slope", 0, 0, Direction.NEUTRAL, 0)
+        bn = sum(q for _, q in bids[:self.near])
+        bf = sum(q for _, q in bids[self.near:self.far])
+        an = sum(q for _, q in asks[:self.near])
+        af = sum(q for _, q in asks[self.near:self.far])
+        if (bn + bf + an + af) <= 0:
+            return Signal("book_slope", 0, 0, Direction.NEUTRAL, 0)
+        # ratio de respaldo: cerca/propio total de cada lado
+        br = bn / max(bn + bf, 1e-9)          # >0.5 => bid stack pegado al touch
+        ar = an / max(an + af, 1e-9)
+        v = br - ar                            # (+) soporte comprador latente
+        norm = max(-1.0, min(1.0, v * 2.5))
+        return Signal("book_slope", v, norm, dir_from(norm, 0.12),
+                      min(abs(v) / 0.25, 1.0))
+
+
+# 2. Wall Momentum (muros que CRECEN)
+class WallMomentum:
+    """Detecta niveles con >=X BTC que están ENGORDANDO entre snapshots.
+
+    Un muro estacionario es estático (soporte/resistencia). Un muro que GANA
+    tamaño mientras el precio se acerca es intención activa de defender/comprar
+    y anticipa rebote o ruptura a su favor. Los muros que adelgazan se ignoran.
+    """
+
+    def __init__(self, min_wall_btc: float = 15.0, poll_sec: float = 1.0):
+        self.min_wall = min_wall_btc
+        self.poll = poll_sec
+        self._prev: Dict[float, float] = {}
+        self._last_ts = 0.0
+
+    def _walls(self, book: SimpleOBM) -> Tuple[Dict[float, float], Dict[float, float]]:
+        bids, asks = _sides(book, 30)
+        wb = {p: q for p, q in bids if q >= self.min_wall}
+        wa = {p: q for p, q in asks if q >= self.min_wall}
+        return wb, wa
+
+    def calculate(self, book: SimpleOBM) -> Signal:
+        now = time.time()
+        if now - self._last_ts < self.poll:
+            # sin nuevo muestreo: decaimiento suave para no congelar el valor viejo
+            return Signal("wall_momentum", 0, 0, Direction.NEUTRAL, 0.0)
+        self._last_ts = now
+        wb, wa = self._walls(book)
+        growth_b = sum(q - self._prev[p] for p, q in wb.items()
+                       if p in self._prev and q > self._prev[p])
+        growth_a = sum(q - self._prev[p] for p, q in wa.items()
+                       if p in self._prev and q > self._prev[p])
+        self._prev = {**wb, **wa}
+        tot = growth_b + growth_a
+        if tot <= 0:
+            return Signal("wall_momentum", 0, 0, Direction.NEUTRAL, 0.15)
+        v = (growth_b - growth_a) / tot
+        norm = max(-1.0, min(1.0, v * 1.6))
+        conf = min(tot / (self.min_wall * 2), 1.0)
+        return Signal("wall_momentum", v, norm, dir_from(norm, 0.15), conf)
+
+
+# 3. OFI ponderado por profundidad (near vs deep)
+class WeightedOFI:
+    """Order Flow Imbalance del LIBRO (no de trades): añade/cancela entre deltas.
+
+    Pondera x3 los cambios en las primeras 5 niveles (intención accionable) y x1
+    los profundos. Es la señal más predictiva de micro-movimientos: el mid sigue
+    al near-side OFI con ~1-3s de antelación.
+    """
+
+    def __init__(self, levels: int = 20, decay_half_life: float = 8.0):
+        self.levels = levels
+        self.half_life = decay_half_life
+        self._prev_b: Dict[float, float] = {}
+        self._prev_a: Dict[float, float] = {}
+        self._ewma = 0.0
+        self._ewma_n = 0.0
+        self._last_ts = 0.0
+
+    def calculate(self, book: SimpleOBM) -> Signal:
+        now = time.time()
+        bids, asks = _sides(book, self.levels)
+        cb = dict(bids)
+        ca = dict(asks)
+        near_ofi = deep_ofi = 0.0
+        for i, (p, q) in enumerate(bids):
+            d = q - self._prev_b.get(p, 0.0)
+            w = 3.0 if i < 5 else 1.0
+            near_ofi += d * w if i < 5 else 0.0
+            deep_ofi += d * w if i >= 5 else 0.0
+        for i, (p, q) in enumerate(asks):
+            d = q - self._prev_a.get(p, 0.0)
+            if i < 5:
+                near_ofi -= d * 3.0
+            else:
+                deep_ofi -= d
+        self._prev_b, self._prev_a = cb, ca
+
+        dt = max(now - self._last_ts, 1e-6) if self._last_ts else 1.0
+        self._last_ts = now
+        alpha = 1 - 0.5 ** (dt / self.half_life)
+        raw = near_ofi + 0.3 * deep_ofi
+        self._ewma += alpha * (raw - self._ewma)
+        self._ewma_n += alpha * (abs(raw) - self._ewma_n)  # escala adaptativa
+
+        scale = max(self._ewma_n, 1.0)
+        norm = max(-1.0, min(1.0, self._ewma / scale))
+        conf = min(scale / 20.0, 1.0) * (0.9 if self._ewma_n > 0 else 0.2)
+        return Signal("ofi_weighted", raw, norm, dir_from(norm, 0.18), conf)
+
+
+# 4. Micro-price divergence
+class MicroPriceDeviation:
+    """Precio virtual (mid ponderado por volúmenes del top) vs último trade.
+
+    micro = (Qa*Bid + Qb*Ask)/(Qb+Qa). Cuando el libro "pesa" más abajo del mid,
+    el micro baja ANTES de que caigan los trades. La desviación micro-last es un
+    predictor directo del siguiente tick ejecutado.
+    """
+
+    def __init__(self, smooth_sec: float = 2.0):
+        self._ema = 0.0
+        self._last_ts = 0.0
+
+    def calculate(self, book: SimpleOBM, last_price: float) -> Signal:
+        if last_price <= 0:
+            return Signal("micro_price_dev", 0, 0, Direction.NEUTRAL, 0)
+        bids, asks = _sides(book, 1)
+        if not bids or not asks:
+            return Signal("micro_price_dev", 0, 0, Direction.NEUTRAL, 0)
+        bp, bq = bids[0]
+        ap, aq = asks[0]
+        if bq + aq <= 0:
+            return Signal("micro_price_dev", 0, 0, Direction.NEUTRAL, 0)
+        micro = (aq * bp + bq * ap) / (bq + aq)   # pesa el lado CONTRARIO -> equilibrio
+        dev_pct = (micro - last_price) / last_price * 100
+        now = time.time()
+        dt = now - self._last_ts if self._last_ts else 0.5
+        self._last_ts = now
+        alpha = 1 - 0.5 ** (max(dt, 1e-6) / self.smooth_sec)
+        self._ema += alpha * (dev_pct - self._ema)
+        norm = max(-1.0, min(1.0, self._ema / 0.02))  # 0.02% = señal plena
+        conf = min(abs(self._ema) / 0.01, 1.0)
+        return Signal("micro_price_dev", self._ema, norm, dir_from(norm, 0.2), conf)
+
+
+# 5. CVD Divergence (absorción anticipativa)
+class CVDDivergence:
+    """Divergencia entre delta de CVD y delta de precio en la última ventana.
+
+    Casos anticipativos (no reactivos):
+      - Precio plano/bajando pero CVD SUBIENDO fuerte  -> oferta absorbida,
+        el comprador agotará la pared: LONG inminente.
+      - Precio plano/subiendo pero CVD BAJANDO         -> demanda absorbida: SHORT.
+    (La versión clásica follow-the-trend ya vive en 'cvd'; aquí solo divergencia.)
+    """
+
+    def __init__(self, window_sec: float = 45.0):
+        self.window = window_sec
+        self.cvd_hist: deque = deque(maxlen=600)
+        self.price_hist: deque = deque(maxlen=600)
+
+    def add_trade(self, ts: float, price: float, qty: float, maker: bool):
+        prev_cvd = self.cvd_hist[-1][1] if self.cvd_hist else 0.0
+        delta = qty if not maker else -qty
+        self.cvd_hist.append((ts, prev_cvd + delta))
+        self.price_hist.append((ts, price))
+
+    def calculate(self) -> Signal:
+        now = time.time()
+        c = [(t, v) for t, v in self.cvd_hist if t >= now - self.window]
+        p = [(t, v) for t, v in self.price_hist if t >= now - self.window]
+        if len(c) < 10 or len(p) < 10:
+            return Signal("cvd_divergence", 0, 0, Direction.NEUTRAL, 0)
+        dc = c[-1][1] - c[0][1]
+        dp = (p[-1][1] - p[0][1]) / p[0][1] * 100 if p[0][1] else 0.0
+        # normalizadores independientes por unidad (BTC vs %)
+        cn = max(-1.0, min(1.0, dc / 40.0))
+        pn = max(-1.0, min(1.0, dp / 0.08))
+        div = cn - pn                     # >0: flujo comprador SIN precio alcista
+        norm = max(-1.0, min(1.0, div))
+        strength = abs(div)
+        # solo cuenta si el precio es relativamente plano (|pn| < 0.6);
+        # si ya se movió con el flujo, eso es tendencia (la cubre 'cvd')
+        if abs(pn) >= 0.6:
+            strength *= 0.35
+        conf = min(strength / 0.8, 1.0)
+        return Signal("cvd_divergence", div, norm, dir_from(norm, 0.25), conf)
+
+
+# 6. Trade Arrival Run (agresores consecutivos con precio quieto)
+class TradeArrivalRun:
+    """Rachas de takers del mismo lado mientras el precio apenas muta.
+
+    N trades seguidos comprando + micro-movimiento nulo = alguien está comiendo
+    un iceberg; cuando la pared se agote, el salto es casi seguro en la dirección
+    del agresor. Caduca rápido (ventana corta) porque es una señal de SEGUNDOS.
+    """
+
+    def __init__(self, window_sec: float = 6.0, min_run: int = 8):
+        self.window = window_sec
+        self.min_run = min_run
+        self.trades: deque = deque(maxlen=400)
+
+    def add_trade(self, ts: float, price: float, qty: float, maker: bool):
+        self.trades.append((ts, price, qty, maker))
+
+    def calculate(self) -> Signal:
+        now = time.time()
+        recent = [t for t in self.trades if t[0] >= now - self.window]
+        if len(recent) < self.min_run:
+            return Signal("trade_arrival", 0, 0, Direction.NEUTRAL, 0)
+        # racha final del mismo lado agresor
+        side = 1 if not recent[-1][3] else -1
+        run = 0
+        usd = 0.0
+        for _, pr, q, mk in reversed(recent):
+            s = -1 if mk else 1
+            if s != side:
+                break
+            run += 1
+            usd += pr * q
+        move = (recent[-1][1] - recent[0][1]) / recent[0][1] * 100 if recent[0][1] else 0
+        quiet = max(0.0, 1.0 - abs(move) / 0.05)      # precio plano = 1
+        v = side * min(run / 20.0, 1.0) * (0.4 + 0.6 * quiet)
+        norm = max(-1.0, min(1.0, v))
+        conf = min(run / (self.min_run * 2), 1.0) * (0.5 + 0.5 * quiet)
+        return Signal("trade_arrival", v, norm, dir_from(norm, 0.2), conf)
+
+
+# ================================================================ AMPLITUD
+
+# 7. Liquidity Thinning
+class LiquidityThinning:
+    """Ambos lados del libro perdiendo tamaño SIMULTÁNEAMENTE.
+
+    Es el precursor clásico de movimiento ampliado: sin liquidez, un market order
+    mediano desplaza decenas de ticks. direction_hint: el lado que conserva menos
+    tamaño es el que se rompe primero.
+    """
+
+    def __init__(self, levels: int = 20, half_life: float = 20.0):
+        self.levels = levels
+        self.half_life = half_life
+        self._base_bid = 0.0
+        self._base_ask = 0.0
+        self._last_ts = 0.0
+
+    def calculate(self, book: SimpleOBM) -> Signal:
+        now = time.time()
+        bids, asks = _sides(book, self.levels)
+        tb = sum(q for _, q in bids)
+        ta = sum(q for _, q in asks)
+        if self._last_ts == 0:
+            self._base_bid, self._base_ask = tb, ta
+            self._last_ts = now
+            return Signal("liquidity_thinning", 0, 0, Direction.NEUTRAL, 0.1)
+        dt = now - self._last_ts
+        self._last_ts = now
+        alpha = 1 - 0.5 ** (dt / self.half_life)
+        self._base_bid += alpha * (tb - self._base_bid)
+        self._base_ask += alpha * (ta - self._base_ask)
+        if self._base_bid <= 0 or self._base_ask <= 0:
+            return Signal("liquidity_thinning", 0, 0, Direction.NEUTRAL, 0)
+        rb = tb / self._base_bid
+        ra = ta / self._base_ask
+        thin = max(0.0, 1.0 - min(rb, ra))            # 0 = normal, 1 = vacío total
+        both_thin = thin if (rb < 1.0 and ra < 1.0) else thin * 0.4
+        norm = min(both_thin / 0.35, 1.0)             # 35% de pérdida = amplitud plena
+        hint = Direction.NEUTRAL
+        if norm > 0.3:
+            hint = Direction.LONG if rb < ra else Direction.SHORT  # lado delgado cede
+        return Signal("liquidity_thinning", thin, norm, hint, 0.8,
+                      metadata={"hint": hint.name, "rb": round(rb, 3), "ra": round(ra, 3)})
+
+
+# 8. Spread Compression / Coiling
+class SpreadCompression:
+    """Spread en mínimos relativos + apilado de tamaño cerca del touch.
+
+    El mercado se 'enrosca' antes de romper: la dispersión cae por debajo de su
+    base y el interés abierto latente se acumula. norm alto = breakout cercano
+    (dirección indeterminada; el motor la toma de las señales direccionales).
+    """
+
+    def __init__(self, half_life: float = 120.0):
+        self.half_life = half_life
+        self._base_spread = 0.0
+        self._last_ts = 0.0
+
+    def calculate(self, book: SimpleOBM, price: float) -> Signal:
+        now = time.time()
+        bid, ask = book.get_best_bid_ask()
+        if bid <= 0 or ask <= 0 or price <= 0:
+            return Signal("spread_compression", 0, 0, Direction.NEUTRAL, 0)
+        sp = (ask - bid) / price * 100
+        if self._last_ts == 0:
+            self._base_spread, self._last_ts = sp, now
+            return Signal("spread_compression", 0, 0, Direction.NEUTRAL, 0.1)
+        dt = now - self._last_ts
+        self._last_ts = now
+        alpha = 1 - 0.5 ** (dt / self.half_life)
+        self._base_spread += alpha * (sp - self._base_spread)
+        if self._base_spread <= 0:
+            return Signal("spread_compression", 0, 0, Direction.NEUTRAL, 0)
+        ratio = sp / self._base_spread                 # <1 = comprimido
+        comp = max(0.0, 1.0 - ratio)
+        norm = min(comp / 0.5, 1.0)                    # 50% bajo la base = pleno
+        return Signal("spread_compression", ratio, norm, Direction.NEUTRAL, 0.7,
+                      metadata={"ratio": round(ratio, 3)})
+
+
+# 9. Volume Acceleration
+class VolumeAcceleration:
+    """Aceleración del flujo: volumen de los últimos 5s contra la base 60s.
+
+    'volume_spike' mide el NIVEL (ya es tarde: el pico ocurrió). La aceleración
+    (segunda derivada del volumen acumulado) marca el instante en que el flujo
+    empieza a multiplicarse, típicamente 3-10s antes del rango máximo.
+    """
+
+    def __init__(self, burst_sec: float = 5.0, base_sec: float = 60.0):
+        self.burst = burst_sec
+        self.base_w = base_sec
+        self.trades: deque = deque(maxlen=6000)
+        self._prev_acc = 0.0
+
+    def add_trade(self, ts: float, price: float, qty: float, maker: bool):
+        self.trades.append((ts, qty))
+
+    def calculate(self) -> Signal:
+        now = time.time()
+        burst_v = sum(q for t, q in self.trades if t >= now - self.burst)
+        base_v = sum(q for t, q in self.trades if t >= now - self.base_w)
+        if base_v <= 0:
+            return Signal("volume_accel", 0, 0, Direction.NEUTRAL, 0)
+        rate_now = burst_v / self.burst
+        rate_base = base_v / self.base_w
+        accel = rate_now / max(rate_base, 1e-9)        # 1 = neutro, 3 = x3 flujo
+        self._prev_acc = accel
+        norm = min(max((accel - 1.2) / 2.5, 0.0), 1.0)
+        conf = 0.85 if burst_v > 0 else 0.2
+        return Signal("volume_accel", accel, norm, Direction.NEUTRAL, conf)

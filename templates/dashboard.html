@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTC/USDT Bot v14.0.1 — Control Center</title>
+<style>
+  :root {
+    --bg: #0a0e17; --panel: #111827; --border: #1f2a3d;
+    --txt: #e5edf7; --muted: #8296b0; --green: #22c55e; --red: #ef4444;
+    --amber: #f59e0b; --cyan: #06b6d4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--txt); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; display: flex; flex-direction: column; overflow: hidden; }
+
+  header { padding: 8px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: #0d1420; flex-shrink: 0; }
+  h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.5px; }
+  h1 span { color: var(--cyan); font-weight: 400; }
+  .header-right { display: flex; gap: 8px; align-items: center; }
+  .pill { padding: 3px 9px; border-radius: 10px; font-size: 10px; font-weight: 600; border: 1px solid var(--border); display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
+  .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  /* FIX layout: minmax(0,...) evita que el grid desborde y "empuje" la sidebar */
+  .main-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 400px); flex: 1; min-height: 0; }
+
+  .chart-area { border-right: 1px solid var(--border); display: flex; flex-direction: column; position: relative; min-width: 0; min-height: 0; }
+  .chart-header { padding: 5px 15px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; background: #0d1420; flex-shrink: 0; }
+  .tv-widget-container { flex: 1; min-height: 0; width: 100%; }
+  /* FIX v12.8: el skeleton ANTES vivía con "inset:0" dentro de .chart-area (position:relative),
+     o sea cubría TODA la columna derecha y solo se ocultaba si aparecía el iframe de TradingView.
+     Sin conexión a s3.tradingview.com el iframe nunca llegaba => capa oscura permanente.
+     Ahora es hijo del propio contenedor del widget, se oculta SIEMPRE al cargar el script
+     (éxito o fallo) y tiene auto-expiración de seguridad. */
+  .tv-widget-container { position: relative; }
+  /* FIX v13.0: el skeleton ya NO usa backdrop-filter (creaba una capa compuesta oscura que
+     en algunos navegadores quedaba "pegada" tapando la columna derecha aunque se ocultara),
+     ni depende de clases para desaparecer: es un hijo normal del flujo y se ELIMINA del DOM
+     (display:none + remove). Imposible que deje residuo visual. */
+  .tv-skeleton { display: flex; align-items: center; justify-content: center; gap: 8px; height: 42px; margin: 8px 12px; border-radius: 6px; color: var(--muted); font-size: 11px; background: #182235; overflow: hidden; position: relative; }
+  .tv-skeleton::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(130,150,176,0.12), transparent); animation: shimmer 1.4s infinite; background-size: 200% 100%; }
+  .tv-skeleton.gone { display: none !important; }
+  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+  .tv-offline-note { padding: 6px 15px; border-bottom: 1px solid var(--border); font-size: 10px; color: var(--amber, #f59e0b); background: #0d1420; display: none; flex-shrink: 0; }
+  .tv-offline-note.show { display: block; }
+
+  .sidebar { display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; background: #0d1420; min-height: 0; overscroll-behavior: contain; }
+  .sidebar::-webkit-scrollbar { width: 5px; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .price-block {
+    background: linear-gradient(135deg, #0d1420 0%, #111827 100%);
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  .price-main { display: flex; flex-direction: column; }
+  .price-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 3px; }
+  .price-value {
+    font-size: 32px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.5px;
+    transition: color 0.15s ease;
+  }
+  .price-value.up { color: var(--green); text-shadow: 0 0 15px rgba(34, 197, 94, 0.4); }
+  .price-value.down { color: var(--red); text-shadow: 0 0 15px rgba(239, 68, 68, 0.4); }
+  .price-value.neutral { color: var(--txt); }
+
+  .price-flash { animation: priceFlash 0.25s ease; }
+  @keyframes priceFlash {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.015); }
+    100% { transform: scale(1); }
+  }
+
+  .price-side { display: flex; flex-direction: column; gap: 5px; align-items: flex-end; }
+  .price-change {
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    padding: 3px 10px;
+    border-radius: 4px;
+    transition: all 0.15s ease;
+  }
+  .price-change.up { background: rgba(34, 197, 94, 0.15); color: var(--green); }
+  .price-change.down { background: rgba(239, 68, 68, 0.15); color: var(--red); }
+  .price-change.neutral { background: rgba(130, 150, 176, 0.1); color: var(--muted); }
+  .flow-indicator {
+    font-size: 9px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .flow-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); transition: background 0.3s; }
+  .flow-dot.slow { background: var(--amber); }
+  .flow-dot.dead { background: var(--red); }
+  .flow-hz { font-weight: 700; color: var(--cyan); font-variant-numeric: tabular-nums; }
+
+  .direction-block {
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--border);
+    background: #0d1420;
+  }
+  .block-title {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .score-bar-container { margin-bottom: 6px; }
+  .score-bar-container:last-child { margin-bottom: 0; }
+  .score-bar-label { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; font-size: 10px; }
+  .score-bar-label .name { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .score-bar-label .value { font-weight: 700; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .score-bar { height: 14px; background: #182235; border-radius: 3px; position: relative; overflow: hidden; }
+  .score-bar-fill { height: 100%; transition: width 0.4s ease, background-color 0.3s ease, left 0.4s ease; border-radius: 3px; position: absolute; top: 0; }
+  .score-bar-fill.long { background: linear-gradient(90deg, var(--green), #16a34a); }
+  .score-bar-fill.short { background: linear-gradient(90deg, var(--red), #dc2626); }
+  .score-bar-fill.neutral { background: var(--muted); }
+  .score-bar-center { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--border); z-index: 1; }
+  .decision-line {
+    text-align: center;
+    margin-top: 6px;
+    font-size: 10px;
+    color: var(--muted);
+  }
+  .decision-line b { font-size: 12px; letter-spacing: 1px; }
+
+  .position-block {
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+    background: #0a0e17;
+    text-align: center;
+  }
+  .position-big {
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: 3px;
+    padding: 10px 0;
+    border-radius: 6px;
+    margin-bottom: 8px;
+  }
+  .position-big.long {
+    background: linear-gradient(90deg, rgba(34, 197, 94, 0.15), rgba(34, 197, 94, 0.05));
+    color: var(--green);
+    border: 1px solid rgba(34, 197, 94, 0.4);
+    text-shadow: 0 0 10px rgba(34, 197, 94, 0.3);
+  }
+  .position-big.short {
+    background: linear-gradient(90deg, rgba(239, 68, 68, 0.15), rgba(239, 68, 68, 0.05));
+    color: var(--red);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    text-shadow: 0 0 10px rgba(239, 68, 68, 0.3);
+  }
+  .position-big.flat {
+    background: rgba(130, 150, 176, 0.1);
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .position-info {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    font-size: 10px;
+    text-align: center;
+  }
+  .position-info .item { background: #182235; padding: 6px 4px; border-radius: 4px; }
+  .position-info .label { color: var(--muted); font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .position-info .val { font-weight: 700; font-size: 11px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+  .perf-block {
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--border);
+    background: #0d1420;
+  }
+  .perf-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+  }
+  .perf-item {
+    background: #182235;
+    padding: 6px 4px;
+    border-radius: 4px;
+    text-align: center;
+  }
+  .perf-item .label { font-size: 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .perf-item .val { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .pos { color: var(--green); } .neg { color: var(--red); } .neutral { color: var(--muted); }
+
+  .control-block {
+    padding: 8px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .btns { display: flex; gap: 4px; margin-top: 5px; }
+  button { flex: 1; background: #182235; color: var(--txt); border: 1px solid var(--border); padding: 6px; border-radius: 4px; cursor: pointer; font-size: 10px; font-weight: 600; transition: 0.15s; }
+  button:hover:not(:disabled) { background: #223250; border-color: #33507a; }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+  button.active { background: #123a2a; border-color: var(--green); color: var(--green); }
+  button.long { border-color: #215b35; color: var(--green); }
+  button.short { border-color: #652626; color: var(--red); }
+  button.close { border-color: #6b541f; color: var(--amber); }
+
+  .signals-block {
+    padding: 8px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .signals-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; }
+  .signal-item { background: #182235; border-radius: 4px; padding: 5px 7px; display: flex; align-items: center; gap: 6px; }
+  .signal-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .signal-dot.long { background: var(--green); box-shadow: 0 0 4px var(--green); }
+  .signal-dot.short { background: var(--red); box-shadow: 0 0 4px var(--red); }
+  .signal-dot.neutral { background: var(--muted); }
+  .signal-info { flex: 1; min-width: 0; }
+  .signal-name { font-size: 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .signal-value { font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .signal-value.pos { color: var(--green); }
+  .signal-value.neg { color: var(--red); }
+  .signal-value.neutral { color: var(--muted); }
+
+  .trades-block {
+    padding: 8px 18px;
+    display: flex;
+    flex-direction: column;
+    max-height: 280px;
+    flex-shrink: 0;
+  }
+  .scroll-table { flex: 1; overflow-y: auto; font-size: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 3px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: #0d1420; font-size: 8px; text-transform: uppercase; }
+  td { padding: 4px 3px; border-bottom: 1px solid #172032; font-variant-numeric: tabular-nums; font-size: 10px; }
+
+  .trade-win { background: rgba(34, 197, 94, 0.06); }
+  .trade-loss { background: rgba(239, 68, 68, 0.06); }
+
+  /* bloque de datos obsoleto (WS caído) */
+  /* FIX v13.1 — LA capa oscura que seguía tapando los CUADROS eran estas reglas:
+     `.stale ... { color: var(--muted) !important }` se comía el blanco del precio
+     y de TODOS los valores al quedar el feed >5s sin ticks (y con el throttle de
+     broadcasts mal calibrado, eso ocurría en cuanto el bot respiraba: por eso
+     "arranca en blanco fuerte y luego se pone gris"). Además el `transition:
+     color .4s` sobre decenas de elementos creaba capas de animación residual.
+     Ahora NO existe atenuado automático alguno: el estado obsoleto se señala de
+     forma explícita y pequeña (píldora "lag" roja + banner), y los números
+     conservan siempre su color original (blanco/verde/rojo). */
+
+  /* animaciones solo cuando hay espacio/voluntad del usuario */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  /* responsive: en pantallas estrechas el gráfico pasa arriba y la sidebar abajo */
+  @media (max-width: 900px) {
+    .main-layout { grid-template-columns: 1fr; grid-template-rows: minmax(220px, 38vh) minmax(0, 1fr); }
+    .chart-area { border-right: none; border-bottom: 1px solid var(--border); }
+    .sidebar { border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ BTC/USDT <span>Engine v14.0.1</span></h1>
+  <div class="header-right">
+    <span class="pill"><i id="wsDot" class="dot"></i><span id="wsText">Conectando…</span></span>
+    <span class="pill" id="lagPill" title="Latencia del feed de datos (tiempo desde el último tick)">lag —</span>
+    <span class="pill" id="statePill" style="color:var(--muted)">INICIANDO</span>
+    <span class="pill" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<div class="main-layout">
+
+  <div class="chart-area">
+    <div class="chart-header">
+      <span>📊 BYBIT:BTCUSDT.P · 1m</span>
+      <span style="color:var(--cyan);">Feed en vivo</span>
+    </div>
+    <div class="tv-offline-note" id="tvOfflineNote">⚠️ Gráfico TradingView no disponible (sin acceso a s3.tradingview.com). El bot y las señales siguen funcionando con datos propios.</div>
+    <div class="tv-widget-container">
+      <div class="tradingview-widget-container" style="height:100%;width:100%">
+        <div id="tradingview_chart" style="height:100%;width:100%"></div>
+        <div class="tv-skeleton" id="tvSkeleton">Cargando gráfico TradingView…</div>
+        <script type="text/javascript" src="https://s3.tradingview.com/tv.js" async onload="window.__tvjsLoaded=true" onerror="window.__tvjsFailed=true"></script>
+        <script type="text/javascript">
+        // FIX v13.0: hideSkeleton oculta Y ELIMINA el nodo del DOM (display:none + remove),
+        // ya no es una capa absolute con backdrop-filter que pudiera quedar "pegada" tapando
+        // la columna derecha. Además corre garantizado en TODAS las rutas: éxito, fallo de
+        // red del script, widget sin iframe tras 20s, y expiración dura a los 6s.
+        const hideSkeleton = () => { const s = document.getElementById('tvSkeleton'); if (s) { s.classList.add('gone'); s.remove(); } };
+        setTimeout(hideSkeleton, 6000);            // corte duro de seguridad
+        let tvTries = 0;
+        function initTV() {
+          if (window.__tvjsFailed) { document.getElementById('tvOfflineNote').classList.add('show'); hideSkeleton(); return; }
+          if (typeof TradingView === 'undefined') { if (++tvTries > 40) { document.getElementById('tvOfflineNote').classList.add('show'); hideSkeleton(); return; } setTimeout(initTV, 300); return; }
+          new TradingView.widget({
+            "autosize": true,
+            "symbol": "BYBIT:BTCUSDT.P",
+            "interval": "1",
+            "timezone": "Etc/UTC",
+            "theme": "dark",
+            "style": "1",
+            "locale": "es",
+            "toolbar_bg": "#111827",
+            "enable_publishing": false,
+            "hide_top_toolbar": false,
+            "hide_legend": false,
+            "save_image": false,
+            "allow_symbol_change": false,
+            "container_id": "tradingview_chart",
+            "studies": ["MASimple@tv-basicstudies"],
+            "withdateranges": true
+          });
+          // ocultar skeleton cuando el iframe del widget esté listo (y como muy tarde a los 20s)
+          const check = setInterval(() => {
+            if (document.querySelector('#tradingview_chart iframe')) { clearInterval(check); setTimeout(hideSkeleton, 400); }
+          }, 500);
+          setTimeout(() => { clearInterval(check); hideSkeleton(); }, 20000);
+        }
+        initTV();
+        </script>
+      </div>
+    </div>
+  </div>
+
+  <div class="sidebar">
+
+    <!-- 1. PRECIO -->
+    <div class="price-block">
+      <div class="price-main">
+        <div class="price-label">BTC/USDT · Bybit Live</div>
+        <div class="price-value neutral" id="priceBig">$0.0</div>
+      </div>
+      <div class="price-side">
+        <div class="price-change neutral" id="priceChange">+0.00</div>
+        <div class="flow-indicator">
+          <i class="flow-dot" id="flowDot"></i>
+          <span class="flow-hz" id="flowHz">0.0 Hz</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. DIRECCIÓN -->
+    <div class="direction-block">
+      <div class="block-title">
+        <span>🎯 Dirección que ve el bot</span>
+        <span id="alignedCount" style="color:var(--cyan);">0/8</span>
+      </div>
+
+      <div class="score-bar-container">
+        <div class="score-bar-label">
+          <span class="name">Dirección</span>
+          <span class="value neutral" id="dirScoreValue">0.00</span>
+        </div>
+        <div class="score-bar">
+          <div class="score-bar-center"></div>
+          <div class="score-bar-fill neutral" id="dirScoreBar" style="width: 0%; left: 50%;"></div>
+        </div>
+      </div>
+
+      <div class="score-bar-container">
+        <div class="score-bar-label">
+          <span class="name">Amplitud</span>
+          <span class="value neutral" id="ampScoreValue">0.00</span>
+        </div>
+        <div class="score-bar">
+          <div class="score-bar-center"></div>
+          <div class="score-bar-fill neutral" id="ampScoreBar" style="width: 0%; left: 50%;"></div>
+        </div>
+      </div>
+
+      <div class="decision-line">
+        Decisión: <b id="decisionText" style="color:var(--txt);">HOLD</b>
+      </div>
+    </div>
+
+    <!-- 3. POSICIÓN -->
+    <div class="position-block">
+      <div class="block-title" style="margin-bottom:4px;">
+        <span>📌 Posición</span>
+        <span id="posDuration" style="color:var(--muted);font-size:9px;"></span>
+      </div>
+      <div class="position-big flat" id="positionBig">SIN POSICIÓN</div>
+      <div class="position-info">
+        <div class="item">
+          <div class="label">Entrada</div>
+          <div class="val" id="posEntry">—</div>
+        </div>
+        <div class="item">
+          <div class="label">Tamaño</div>
+          <div class="val" id="posSize">—</div>
+        </div>
+        <div class="item">
+          <div class="label">uPnL (en vivo)</div>
+          <div class="val neutral" id="posPnl">$0.00</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. RENDIMIENTO -->
+    <div class="perf-block">
+      <div class="block-title">💰 Rendimiento</div>
+      <div class="perf-grid">
+        <div class="perf-item" title="Win Rate Direccional: % de trades que acertaron la dirección">
+          <div class="label">WR Dir</div>
+          <div class="val" id="wrBig" style="color:var(--cyan);">0%</div>
+        </div>
+        <div class="perf-item">
+          <div class="label">W / L</div>
+          <div class="val" id="wlCount">0/0</div>
+        </div>
+        <div class="perf-item" title="PnL Neto: suma de ganancias/pérdidas después de fees">
+          <div class="label">PnL Neto</div>
+          <div class="val neutral" id="sessionPnl">$0</div>
+        </div>
+        <div class="perf-item">
+          <div class="label">Balance</div>
+          <div class="val neutral" id="balance">$0</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. CONTROL (movido aquí) -->
+    <div class="control-block">
+      <div class="block-title">⚙️ Control</div>
+      <div class="btns">
+        <button id="btnAuto" onclick="setMode('AUTO')" class="active">🤖 AUTO</button>
+        <button id="btnManual" onclick="setMode('MANUAL')">👤 MANUAL</button>
+      </div>
+      <div class="btns">
+        <button class="long" id="btnLong" onclick="trade('LONG')" disabled>🟢 LONG</button>
+        <button class="short" id="btnShort" onclick="trade('SHORT')" disabled>🔴 SHORT</button>
+        <button class="close" id="btnClose" onclick="trade('CLOSE')" disabled>⚪ CERRAR</button>
+      </div>
+    </div>
+
+    <!-- 6. SEÑALES -->
+    <div class="signals-block">
+      <div class="block-title">🧭 Señales <span id="sigCount" style="color:var(--cyan);">0/25</span></div>
+      <div class="signals-grid" id="dirSignalsGrid"></div>
+      <div style="height:4px;"></div>
+      <div class="signals-grid" id="ampSignalsGrid"></div>
+    </div>
+
+    <!-- 7. TRADES (con altura fija) -->
+    <div class="trades-block">
+      <div class="block-title">💹 Últimos Trades</div>
+      <div class="scroll-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Hora</th>
+              <th>Acc</th>
+              <th>Dir</th>
+              <th>Precio Neto</th>
+              <th>Neto</th>
+            </tr>
+          </thead>
+          <tbody id="tradesTable"><tr><td colspan="5" class="neutral">Sin trades</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const num = (v, d=2) => (Number.isFinite(+v) ? (+v).toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—');
+const sign = v => (+v >= 0 ? '+' : '') + num(v, 2);
+const time = ts => new Date(ts * 1000).toLocaleTimeString('es-ES', {hour12:false});
+
+let lastMode = '', wsAlive = false;
+let priceUpdatesInWindow = 0;
+let lastHzCalcTime = Date.now();
+let currentHz = 0;
+
+let displayedPrice = 0;
+let targetPrice = 0;
+let lastPriceUpdateTime = 0;   // performance.now() del último tick
+let lastTickServerTs = 0;      // time.time() del último tick (para lag)
+let lastSignalAge = 0;         // FIX v13.3: edad del feed WS medida por el bot
+let lastTradesVersion = -1;    // solo re-renderizar tabla de trades si cambió
+let lastSignalsKey = {};       // solo re-renderizar señales si cambiaron (por grid)
+let lastPosSide = '';
+
+// ---- animación de precio con easing suave y límite de velocidad ----
+// antes: `* t` con t=elapsed*10 -> saltos bruscos que se "cortaban" cuando el
+// rAF se ralentizaba. Ahora interpolación exponencial independiente del framerate.
+let rafRunning = false;
+function ensureRaf() {
+  if (!rafRunning) { rafRunning = true; requestAnimationFrame(animatePrice); }
+}
+function animatePrice() {
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - (animatePrice._last || now)) / 1000);
+  animatePrice._last = now;
+
+  const gap = targetPrice - displayedPrice;
+  if (Math.abs(gap) < 0.02 || (now - lastPriceUpdateTime) > 1500) {
+    displayedPrice = targetPrice;
+    rafRunning = false;
+    paintPrice();
+    return; // deja de gastar frames hasta el próximo tick
+  }
+  // suavizado exponencial (~120ms de constante de tiempo) + cap de velocidad
+  const k = 1 - Math.exp(-dt / 0.12);
+  let step = gap * k;
+  const maxStep = 15 * dt * Math.max(1, targetPrice / 60000); // ~15 $/s escalado
+  if (Math.abs(step) > maxStep) step = Math.sign(step) * maxStep;
+  displayedPrice += step;
+  paintPrice();
+  requestAnimationFrame(animatePrice);
+}
+function paintPrice() {
+  const priceEl = $('priceBig');
+  if (priceEl) priceEl.textContent = '$' + num(displayedPrice, 1);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  const elapsed = (now - lastHzCalcTime) / 1000;
+  currentHz = priceUpdatesInWindow / elapsed;
+  priceUpdatesInWindow = 0;
+  lastHzCalcTime = now;
+
+  const hzEl = $('flowHz');
+  const flowDot = $('flowDot');
+  if (hzEl) {
+    hzEl.textContent = currentHz.toFixed(1) + ' Hz';
+    if (currentHz >= 5) flowDot.className = 'flow-dot';
+    else if (currentHz >= 1) flowDot.className = 'flow-dot slow';
+    else flowDot.className = 'flow-dot dead';
+  }
+
+  // lag visible: tiempo desde el último tick recibido
+  const lagEl = $('lagPill');
+  if (lagEl && lastTickServerTs > 0) {
+    const lagS = Math.max(0, Date.now() / 1000 - lastTickServerTs);
+    lagEl.textContent = 'lag ' + (lagS < 1 ? (lagS * 1000).toFixed(0) + ' ms' : lagS.toFixed(1) + ' s');
+    lagEl.style.color = lagS < 1.5 ? 'var(--green)' : lagS < 5 ? 'var(--amber)' : 'var(--red)';
+  } else if (lagEl) {
+    lagEl.textContent = 'lag —';
+    lagEl.style.color = 'var(--muted)';
+  }
+
+  // FIX v13.3: feed muerto -> aviso EXPLÍCITO en la píldora de estado (nunca
+  // capas oscuras ni números grises). Si el bot no recibe WS, las barras se
+  // quedan donde están y esto lo dice; antes parecía "lag" del layout.
+  const stEl = $('statePill') || $('botStateText');
+  if (stEl && typeof lastSignalAge === 'number') {
+    if (lastSignalAge > 10) stEl.title = 'Feed Bybit mudo hace ' + lastSignalAge.toFixed(0) + 's (el bot reconecta solo)';
+    else stEl.title = 'Feed fresco (' + lastSignalAge.toFixed(1) + 's)';
+  }
+}, 1000);
+
+function updateScoreBar(barId, valueId, score) {
+  const bar = $(barId);
+  const valueEl = $(valueId);
+  const percent = Math.min(100, Math.max(0, (score + 1) * 50));
+
+  let colorClass = 'neutral';
+  if (score > 0.1) colorClass = 'long';
+  else if (score < -0.1) colorClass = 'short';
+
+  if (score >= 0) {
+    bar.style.left = '50%';
+    bar.style.width = (percent - 50) + '%';
+  } else {
+    bar.style.left = percent + '%';
+    bar.style.width = (50 - percent) + '%';
+  }
+  bar.className = 'score-bar-fill ' + colorClass;
+  valueEl.textContent = sign(score);
+  valueEl.className = 'value ' + colorClass;
+}
+
+function renderSignalsGrid(gridId, signals) {
+  const grid = $(gridId);
+  const entries = Object.entries(signals || {});
+  // FIX fluidez: si el contenido es idéntico (mismos valores), NO se toca el DOM.
+  // Antes cada estado (~2s) reconstruía las 13 tarjetas con innerHTML -> parpadeo.
+  const key = gridId + '|' + entries.map(([n, s]) => `${n}:${(+s.normalized||0).toFixed(2)}:${s.direction||''}`).join(',');
+  if (key === lastSignalsKey[gridId]) return;
+  lastSignalsKey[gridId] = key;
+  if (!entries.length) {
+    grid.innerHTML = '<div class="neutral" style="grid-column: 1/-1; text-align: center; padding: 8px; font-size: 9px;">Esperando...</div>';
+    return;
+  }
+  grid.innerHTML = entries.map(([name, s]) => {
+    const n = +s.normalized || 0;
+    const c = +s.confidence || 0;
+    const dir = s.direction || 'NEUTRAL';
+    let dotClass = 'neutral', valueClass = 'neutral';
+    if (dir === 'LONG' || n > 0.1) { dotClass = 'long'; valueClass = 'pos'; }
+    else if (dir === 'SHORT' || n < -0.1) { dotClass = 'short'; valueClass = 'neg'; }
+    return `
+      <div class="signal-item" title="Confianza: ${Math.round(c*100)}%">
+        <div class="signal-dot ${dotClass}"></div>
+        <div class="signal-info">
+          <div class="signal-name">${name.replace(/_/g, ' ')}</div>
+          <div class="signal-value ${valueClass}">${sign(n)}</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function calcNetPrice(entry, size, side, currentPrice, feeRate = 0.00055) {
+  if (!entry || !size || size <= 0) return null;
+  const notional = currentPrice * size;
+  const totalFee = notional * feeRate * 2;
+  const feePerBtc = totalFee / size;
+  if (side === 'Buy') {
+    return currentPrice - feePerBtc;
+  } else {
+    return currentPrice + feePerBtc;
+  }
+}
+
+function handlePriceTick(data) {
+  priceUpdatesInWindow++;
+  const price = data.last_price || 0;
+  const priceChange = data.price_change || 0;
+  const upnl = data.unrealized_pnl || 0;
+
+  lastTickServerTs = data.price_update_time || (Date.now() / 1000);
+
+  if (Math.abs(price - targetPrice) > 0.01) {
+    targetPrice = price;
+    lastPriceUpdateTime = performance.now();
+    ensureRaf();
+
+    const priceEl = $('priceBig');
+    if (priceChange > 0) priceEl.className = 'price-value up';
+    else if (priceChange < 0) priceEl.className = 'price-value down';
+
+    // flash solo en movimientos grandes: antes saltaba en CADA tick y el
+    // reflow forzado (void offsetWidth) hacía que todo fuera a tirones
+    if (Math.abs(priceChange) >= 5) {
+      priceEl.classList.remove('price-flash');
+      void priceEl.offsetWidth;
+      priceEl.classList.add('price-flash');
+    }
+  }
+
+  const changeEl = $('priceChange');
+  if (priceChange > 0) {
+    changeEl.textContent = '+' + num(priceChange, 2);
+    changeEl.className = 'price-change up';
+  } else if (priceChange < 0) {
+    changeEl.textContent = num(priceChange, 2);
+    changeEl.className = 'price-change down';
+  } else {
+    changeEl.textContent = '0.00';
+    changeEl.className = 'price-change neutral';
+  }
+
+  // 🔧 uPnL en vivo se actualiza aquí
+  const upnlEl = $('posPnl');
+  upnlEl.textContent = sign(upnl);
+  upnlEl.className = 'val ' + (upnl > 0 ? 'pos' : upnl < 0 ? 'neg' : 'neutral');
+}
+
+function render(s) {
+  if (!s) return;
+  const a = s.account || {}, r = s.risk_state || {};
+
+  $('clock').textContent = new Date().toLocaleTimeString('es-ES', {hour12:false});
+  // FIX v13.5: el dot solo dependía del WS navegador->servidor, que sigue vivo
+  // aunque el FEED Bybit esté muerto (precio congelado sin aviso). Ahora se usa
+  // también ws_connected/feed_muted enviados por el bot.
+  const feedDead = (s.feed_muted === true) || (typeof s.signal_age_sec === 'number' && s.signal_age_sec > 10);
+  const live = wsAlive && !feedDead;
+  $('wsText').textContent = live ? 'Live' : (feedDead ? 'Feed mudo' : 'Polling');
+  $('wsDot').className = live ? 'dot on' : 'dot';
+  if (feedDead) $('wsDot').style.background = 'var(--red)';
+  else $('wsDot').style.background = '';
+
+  // FIX v13.1: se ELIMINA el marcado automático de "stale" (el que pintaba los
+  // números grises y dejaba el residuo oscuro sobre los cuadros). El feed obsoleto
+  // ahora solo se señala en la píldora "lag" de la cabecera (roja >5s).
+
+  if ((targetPrice === 0 || !isFinite(targetPrice)) && s.last_price > 0) {
+    targetPrice = s.last_price;
+    displayedPrice = s.last_price;
+    paintPrice();
+    // FIX v13.1 (nace en blanco fuerte y luego se pone gris): al sembrar el
+    // precio desde el snapshot, pinta YA su color según price_change y marca la
+    // hora del último tick real — si no, `lag` se quedaba en "—" y el feedAge de
+    // los ticks ligeros salía desfasado.
+    lastTickServerTs = s.price_update_time || (Date.now() / 1000);
+    const seedChange = +s.price_change || 0;
+    const seedEl = $('priceBig');
+    if (seedEl) {
+      if (seedChange > 0) seedEl.className = 'price-value up';
+      else if (seedChange < 0) seedEl.className = 'price-value down';
+      else seedEl.className = 'price-value neutral';
+    }
+  } else if (s.last_price > 0 && Math.abs(s.last_price - targetPrice) > 0.01) {
+    // FIX v13.1 (barras con lag): el estado completo llega cada ~2s; si trae un
+    // precio distinto, se adopta YA (sin esperar al próximo tick ligero).
+    targetPrice = s.last_price;
+    lastPriceUpdateTime = performance.now();
+    ensureRaf();
+  }
+
+  updateScoreBar('dirScoreBar', 'dirScoreValue', s.directional_score || 0);
+  updateScoreBar('ampScoreBar', 'ampScoreValue', s.amplitude_score || 0);
+
+  const dec = s.decision || 'HOLD';
+  $('decisionText').textContent = dec;
+  $('decisionText').style.color = dec === 'LONG' ? 'var(--green)' : dec === 'SHORT' ? 'var(--red)' : 'var(--txt)';
+
+  const dirCount = Object.keys(s.directional_signals || {}).length;
+  const ampCount = Object.keys(s.amplitude_signals || {}).length;
+  $('sigCount').textContent = `${dirCount + ampCount}/25`;
+  $('alignedCount').textContent = s.last_signal ? (s.last_signal.match(/alineadas=(\d+)/)?.[1] || '0') + '/8' : '0/8';
+
+  renderSignalsGrid('dirSignalsGrid', s.directional_signals);
+  renderSignalsGrid('ampSignalsGrid', s.amplitude_signals);
+
+  const side = a.position_side || 'None';
+  if (side !== lastPosSide) {
+    lastPosSide = side;
+    const posBig = $('positionBig');
+    if (side === 'None') {
+      posBig.textContent = 'SIN POSICIÓN';
+      posBig.className = 'position-big flat';
+      $('posEntry').textContent = '—';
+      $('posSize').textContent = '—';
+      $('posPnl').textContent = '$0.00';
+      $('posPnl').className = 'val neutral';
+    } else {
+      posBig.textContent = side === 'Buy' ? '▲ LONG' : '▼ SHORT';
+      posBig.className = 'position-big ' + (side === 'Buy' ? 'long' : 'short');
+      $('posEntry').textContent = a.entry_price ? '$' + num(a.entry_price, 1) : '—';
+      $('posSize').textContent = num(a.position_size || 0, 4) + ' BTC';
+      // uPnL se actualiza en handlePriceTick
+    }
+  }
+
+  const wr = a.win_rate || 0;
+  $('wrBig').textContent = num(wr, 0) + '%';
+  $('wlCount').textContent = `${a.session_wins || 0}/${a.session_losses || 0}`;
+  $('wlCount').className = 'val';
+
+  $('balance').textContent = '$' + num(a.balance_usdt || 0, 0);
+  const sessionPnl = a.session_pnl || 0;
+  $('sessionPnl').textContent = sign(sessionPnl);
+  $('sessionPnl').className = 'val ' + (sessionPnl >= 0 ? 'pos' : 'neg');
+
+  const tr = s.recent_trades || [];
+  // FIX fluidez: la tabla de trades SOLO se re-renderiza cuando cambia
+  // (trades_version). Antes se reconstruía el innerHTML completo cada ~2s,
+  // provocando parpadeos y trabajo de layout innecesario.
+  const tver = s.trades_version ?? -1;
+  if (tver !== lastTradesVersion) {
+    lastTradesVersion = tver;
+    $('tradesTable').innerHTML = tr.slice().reverse().slice(0, 15).map(t => {
+      const net = (+t.net_pnl_usd || (+t.pnl_usd || 0) - (+t.fee_usd || 0));
+      const dirWin = t.directional_win === true || t.directional_win === 1 || t.directional_win === '1';
+      const rowClass = t.event === 'CLOSE' ? (dirWin ? 'trade-win' : 'trade-loss') : '';
+      const dirTag = t.event === 'CLOSE' ? (dirWin ? '<span class="pos">✅</span>' : '<span class="neg">❌</span>') : '—';
+
+      let netPriceStr = '—';
+      if (t.event === 'CLOSE' && t.price && t.size_btc && t.side) {
+        const entrySide = t.side === 'Buy' ? 'Buy' : 'Sell';
+        const netPrice = calcNetPrice(t.price, t.size_btc, entrySide, t.price);
+        if (netPrice) netPriceStr = '$' + num(netPrice, 1);
+      } else if (t.price) {
+        netPriceStr = '$' + num(t.price, 1);
+      }
+
+      return `<tr class="${rowClass}">
+        <td>${time(t.timestamp)}</td>
+        <td>${t.event === 'OPEN' ? (t.side === 'Buy' ? '🟢O' : '🔴O') : (t.side === 'Buy' ? '🟢C' : '🔴C')}</td>
+        <td>${dirTag}</td>
+        <td style="color:var(--cyan);font-weight:600;">${netPriceStr}</td>
+        <td class="${net>=0?'pos':'neg'}">${t.event === 'CLOSE' ? sign(net) : '—'}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="5" class="neutral">Sin trades</td></tr>';
+  }
+
+  const st = s.bot_state || 'IDLE';
+  $('statePill').textContent = st.replace(/_/g, ' ');
+
+  // duración de posición: timestamp de apertura enviado por el bot
+  posOpenedTs = s.position_opened_ts || 0;
+
+  const mode = s.mode || 'AUTO';
+  if (mode !== lastMode) {
+    lastMode = mode;
+    $('btnAuto').classList.toggle('active', mode === 'AUTO');
+    $('btnManual').classList.toggle('active', mode === 'MANUAL');
+    ['btnLong', 'btnShort', 'btnClose'].forEach(id => $(id).disabled = (mode !== 'MANUAL'));
+  }
+}
+
+// ---- duración de posición en vivo (usando position_opened_ts del estado) ----
+let posOpenedTs = 0;
+setInterval(() => {
+  const el = $('posDuration');
+  if (!el) return;
+  if (lastPosSide !== 'None' && posOpenedTs > 0) {
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - posOpenedTs));
+    el.textContent = `⏱ ${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+  } else {
+    el.textContent = '';
+  }
+}, 1000);
+
+async function setMode(mode) {
+  try {
+    const r = await fetch('/api/mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode})});
+    const j = await r.json();
+    if(j.status === 'error') alert('Error: ' + j.message);
+  } catch(e) { alert('Error de conexión'); }
+}
+
+async function trade(action) {
+  if(!confirm(`¿Ejecutar ${action} manualmente?`)) return;
+  try {
+    const r = await fetch('/api/trade', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
+    const j = await r.json();
+    if(j.status === 'error') alert('Error: ' + j.message);
+  } catch(e) { alert('Error de conexión'); }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { wsAlive = true; };
+  ws.onmessage = e => {
+    try {
+      const m = JSON.parse(e.data);
+      if (m.type === 'price') handlePriceTick(m);
+      else if (m.type === 'state') render(m);
+    } catch(err) { console.error('Parse error:', err); }
+  };
+  ws.onclose = () => { wsAlive = false; setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+}
+
+connect();
+setInterval(async () => {
+  if (!wsAlive) {
+    try { const r = await fetch('/api/status'); if(r.ok) render(await r.json()); } catch(e){}
+  }
+}, 3000);
+</script>
+</body>
+</html>
