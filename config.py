@@ -92,6 +92,13 @@ class Config:
     min_amplitude_score: float = 0.30
     min_aligned_signals: int = 2
     min_signal_confidence: float = 0.40
+    # FIX v14.7 (log 03:29-03:34): fuerza minima REAL de una senal para contar
+    # en la confluencia (aligned / fresh_anticip). La confidence no basta:
+    # wall_momentum/trade_arrival publican conf=max(conf,0.5) garantizado
+    # aunque su normalized sea ~0.02 (ruido direccional). Sin este filtro el
+    # log mostraba "SHORT ali=6 ant=3" con px20s subiendo +11.9$ -> aperturas
+    # contra el movimiento real basadas en particulas casi neutras.
+    dir_min_strength: float = 0.25
 
     # FIX v14.1 D1: RiskManager NUNCA se instanciaba (modulo muerto). Parametros:
     use_risk_manager: bool = True

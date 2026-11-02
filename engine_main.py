@@ -1,5 +1,5 @@
 """
-EngineMain v14.5 - Anticipacion real: horizonte 30-60s + confluencia >=3 precursores
+EngineMain v14.7 - Anticipacion real: horizonte 30-60s + confluencia >=3 precursores (fuerza minima |norm|>=0.25)
   - Bloque ANTICIPATIVO dirección (6): book_slope, wall_momentum, ofi_weighted,
     micro_price_dev, cvd_divergence, trade_arrival
   - Bloque ANTICIPATIVO amplitud (3): liquidity_thinning, spread_compression,
@@ -190,7 +190,7 @@ class EngineMain:
         # así detecta el loop en ejecución y monta uvicorn en él (no en un hilo
         # con otro loop -> era la causa del precio congelado).
         server_task = start_web_server()
-        print(f"\n🚀 BTC/USDT v14.5 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
+        print(f"\n🚀 BTC/USDT v14.7 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
         print(f"📊 25 señales (16 clásicas + 9 anticipativas) | Heartbeat + Emergencia ACTIVOS\n")
 
         subs = [f"orderbook.200.{self.cfg.symbol}",
@@ -456,9 +456,18 @@ class EngineMain:
         # direccion NO NEUTRAL: wall_momentum/trade_arrival publican
         # max(conf,0.5) garantizado y una señal NEUTRAL con conf>=0.5 entraba
         # igual al conteo direccional (y podia activar strong_dir).
+        # FIX v14.7 (log 03:29-03:34): el conteo seguia inflado porque admitia
+        # señales DIRECCIONADAS pero CASI NEUTRAS (normalized ~0.02 con
+        # confidence sintetica >=0.5: wall_momentum/trade_arrival publican
+        # max(conf,0.5) garantizado). Con esas particulas el log mostraba
+        # "SHORT ali=6 ant=3" mientras px20s iba +11.9$ SUBIENDO (dir_score
+        # -0.50 era un espejo de reactivas tardias). Ahora solo cuentan las
+        # señales con FUERZA REAL: |normalized| >= dir_min_strength a favor.
+        _min_strength = getattr(self.cfg, "dir_min_strength", 0.25)
         active = [s for s in d_out.signals
                   if s.confidence >= self.cfg.min_signal_confidence
                   and s.direction != Direction.NEUTRAL
+                  and abs(s.normalized) >= _min_strength
                   and s.direction == d_out.direction]
         aligned = len(active)
         combined_score = abs(d_out.score) * min(aligned, 4) / 2
@@ -604,10 +613,16 @@ class EngineMain:
         _fresh_win = max(self.cfg.max_signal_age_sec,
                          getattr(self.cfg, "fresh_gate_window_sec", 6.0))
         fresh_map = self.bus.get_fresh(_fresh_win)
+        # FIX v14.7 (log 03:29-03:34): el gate de confluencia contaba señales
+        # frescas por `confidence`, pero wall_momentum/trade_arrival publican
+        # conf=max(conf,0.5) garantizado aunque su normalized sea ~0 -> el
+        # "ant=3" del log era en parte artano. Ahora se exige la MISMA fuerza
+        # minima (|normalized| >= dir_min_strength) que en `aligned`.
         fresh_anticip_aligned = sum(
             1 for name, s in fresh_map.items()
             if name in ANTICIP_DIR_WEIGHTS
             and s.confidence >= self.cfg.min_signal_confidence
+            and abs(s.normalized) >= _min_strength
             and s.direction == d_out.direction)
 
         # FIX v13.6 CRÍTICO (regla 1 del análisis de logs): la dirección FUERTE
@@ -696,9 +711,12 @@ class EngineMain:
             reasons.append(f"fa({feed_age_now:.1f}s)")
             # FIX v14.6: registrar CUALES son los precursores que SI cuentan
             # (antes era imposible auditar por qué el conteo saltaba 3->1).
+            # FIX v14.7: mismo filtro de fuerza |normalized| >= dir_min_strength
+            # que el gate real, para que la auditoria refleje el conteo exacto.
             _cntd = [n for n, s in fresh_map.items()
                      if n in ANTICIP_DIR_WEIGHTS
                      and s.confidence >= self.cfg.min_signal_confidence
+                     and abs(s.normalized) >= _min_strength
                      and s.direction == d_out.direction]
             if len(_cntd) < self.cfg.min_fresh_anticip_signals:
                 _missing = sorted(set(ANTICIP_DIR_WEIGHTS) - set(_cntd))
