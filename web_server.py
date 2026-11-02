@@ -51,7 +51,13 @@ class AccountInfo:
 
 class BotState:
     def __init__(self):
-        self.mode = "AUTO"
+        # FIX v14.3: el bot ARRANCA SIEMPRE en modo MANUAL. En MANUAL el motor
+        # de decisiones sigue calculando y publicando señales/scores (el
+        # dashboard vive), pero _trade_logic jamas abre ni cierra posiciones
+        # automaticamente: solo ejecuta las ordenes que el operador lance desde
+        # el panel (LONG/SHORT/CERRAR). Para operar en automatico hay que
+        # pulsar explicitamente "AUTO" en el dashboard.
+        self.mode = "MANUAL"
         self.position = "None"
         self.last_price = 0.0
         self.price_change = 0.0

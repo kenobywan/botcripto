@@ -435,7 +435,9 @@
     <div class="control-block">
       <div class="block-title">⚙️ Control</div>
       <div class="btns">
-        <button id="btnAuto" onclick="setMode('AUTO')" class="active">🤖 AUTO</button>
+        <!-- FIX v14.3: sin clase "active" inicial: el bot arranca en MANUAL y
+             el estado real del boton se fija desde el snapshot (s.mode). -->
+        <button id="btnAuto" onclick="setMode('AUTO')">🤖 AUTO</button>
         <button id="btnManual" onclick="setMode('MANUAL')">👤 MANUAL</button>
       </div>
       <div class="btns">
@@ -798,7 +800,8 @@ function render(s) {
   // duración de posición: timestamp de apertura enviado por el bot
   posOpenedTs = s.position_opened_ts || 0;
 
-  const mode = s.mode || 'AUTO';
+  // FIX v14.3: el bot arranca en MANUAL -> el fallback del dashboard tambien.
+  const mode = s.mode || 'MANUAL';
   if (mode !== lastMode) {
     lastMode = mode;
     $('btnAuto').classList.toggle('active', mode === 'AUTO');

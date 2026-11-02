@@ -229,6 +229,23 @@ class WeightedOFI:
         self._last_seq = -1          # secuencia del libro ya consumida
         self._pending_raw = 0.0      # cruas acumuladas desde última publicación
 
+    def reset_baseline(self, bids, asks):
+        """FIX v14.3 G2 (arranque con 'cancel masivo' inventado): al arrancar el
+        bot (o tras una reconexión WS que trae un snapshot nuevo) `_prev_b/_prev_a`
+        están vacíos o desincronizados y la comparación de deltas contra el
+        registro top-N del libro (`book.last_top_b/a`, que sobrevive a la
+        reconexión) fabrica cancels/adds ENORMES inexistentes. En los logs se ve
+        como `order_flow_imb=-1.0` / `ofi_weighted` saturado justo después de
+        conectar: el motor direccional arrancaba sesgado en contra del mercado
+        real durante los primeros segundos. Este método fija la línea base sin
+        emitir delta alguno."""
+        self._prev_b = dict(bids)
+        self._prev_a = dict(asks)
+        self._ewma = 0.0
+        self._ewma_n = 0.0
+        self._pending_raw = 0.0
+        self._last_ts = time.time()
+
     def calculate(self, book: SimpleOBM) -> Signal:
         now = time.time()
         bids, asks = _sides(book, self.levels)
@@ -249,6 +266,14 @@ class WeightedOFI:
             self._last_seq = book._seq
             return Signal("ofi_weighted", 0, 0, Direction.NEUTRAL, 0.2)
         self._last_seq = book._seq
+
+        # FIX v14.3 G2: PRIMERA lectura del arranque (o tras una reconexión que
+        # borró el libro): no existe línea base, así que los deltas contra
+        # `book.last_top_b/a` (registro superviviente de la sesión anterior)
+        # serían artefactos puros. Se fija la base y se emite neutro.
+        if not self._prev_b and not self._prev_a:
+            self.reset_baseline(cb, ca)
+            return Signal("ofi_weighted", 0, 0, Direction.NEUTRAL, 0.2)
 
         near_ofi = deep_ofi = 0.0
         prev_order_b = {p: i for i, p in enumerate(

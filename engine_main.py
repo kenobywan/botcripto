@@ -737,7 +737,13 @@ class EngineMain:
             self._max_favorable_move = 0.0
             # FIX v14.2 (runner): deadline inicial = techo normal; se extiende
             # solo si la direccion sigue viva al vencerlo.
-            self._position_deadline = self._entry_time + cfg.max_trade_duration_sec
+            # FIX v14.3 G1 (NameError): esta linea se escribio usando `cfg`, pero
+            # `cfg = self.cfg` solo existe dentro de _trade_logic; en _open era un
+            # nombre libre -> NameError en CADA apertura: el bot nunca podia abrir
+            # posicion (ni automatica ni manual). El exception quedaba oculto por
+            # `except asyncio.TimeoutError` y el `finally` reseteaba _processing,
+            # asi que parecia "no opera" sin ningun mensaje.
+            self._position_deadline = self._entry_time + self.cfg.max_trade_duration_sec
             self._extension_count = 0
             self.rest.account_info.position_side = self._entry_side
             self.rest.account_info.entry_price = entry_price
