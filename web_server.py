@@ -51,7 +51,13 @@ class AccountInfo:
 
 class BotState:
     def __init__(self):
-        self.mode = "AUTO"
+        # FIX v14.3: el bot ARRANCA SIEMPRE en modo MANUAL. En MANUAL el motor
+        # de decisiones sigue calculando y publicando señales/scores (el
+        # dashboard vive), pero _trade_logic jamas abre ni cierra posiciones
+        # automaticamente: solo ejecuta las ordenes que el operador lance desde
+        # el panel (LONG/SHORT/CERRAR). Para operar en automatico hay que
+        # pulsar explicitamente "AUTO" en el dashboard.
+        self.mode = "MANUAL"
         self.position = "None"
         self.last_price = 0.0
         self.price_change = 0.0
@@ -239,7 +245,34 @@ async def manual_trade(req: TradeRequest):
     if bot_state.mode != "MANUAL":
         return {"status": "error", "message": "Cambia a modo MANUAL primero"}
     if req.action in ["LONG", "SHORT", "CLOSE"]:
+        # FIX v14.4 (mando de golpe): el frontend YA no muestra confirmación
+        # emergente; aquí se fuerza la acción de INMEDIATO: si hay una orden
+        # en vuelo (ENTERING/CLOSING) se espera hasta 3s a que termine para
+        # no pisarla, y se invalida el cache de estado para que el panel
+        # refleje el mando en <100ms sin esperar al siguiente tick del bot.
+        # FIX v14.5: antes se esperaba a que bot_state.bot_state saliera de
+        # ENTERING/CLOSING, pero esos estados viven en BotRunner.self.bot_state y
+        # solo se propagaban al final del tick -> el bucle era decorativo y un
+        # mando podia pisar una orden en vuelo. Ahora se consulta al runner real.
+        runner = getattr(bot_state, "_runner", None)
+        for _ in range(30):
+            busy = bool(getattr(runner, "_processing", False)) \
+                or getattr(runner, "bot_state", "") in ("ENTERING", "CLOSING")
+            if not busy:
+                break
+            await asyncio.sleep(0.1)
         bot_state.position = req.action
+        # FIX v14.4b: si el mando es LONG/SHORT pero YA existe posición real
+        # abierta (p. ej. huérfana tras reinicio), sincronizar con el lado
+        # real: sin esto, el branch MANUAL nunca cerraría (wanted != CLOSE y
+        # pos != None) y el operador vería su botón ignorado.
+        if req.action in ("LONG", "SHORT") and bot_state.account.position_side not in ("None", "", None):
+            real = "LONG" if bot_state.account.position_side == "Buy" else "SHORT"
+            bot_state.position = real
+            await broadcast_state()
+            return {"status": "ok", "position": real,
+                    "note": "ya habia posicion abierta; usa CERRAR"}
+        bot_state._state_dirty = True
         await broadcast_state()
         return {"status": "ok", "position": bot_state.position}
     return {"status": "error", "message": "Acción inválida"}

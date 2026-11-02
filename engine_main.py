@@ -1,5 +1,5 @@
 """
-EngineMain v14.0.1 - Anticipacion real: horizonte 30-60s + confluencia >=3 precursores
+EngineMain v14.8 - + senal anticipativa funding_pressure, oi_delta reclasificada (tabla OI x precio), ls_ratio anti-spread
   - Bloque ANTICIPATIVO dirección (6): book_slope, wall_momentum, ofi_weighted,
     micro_price_dev, cvd_divergence, trade_arrival
   - Bloque ANTICIPATIVO amplitud (3): liquidity_thinning, spread_compression,
@@ -74,7 +74,7 @@ from rest_client import BybitRestClient
 from signals import (
     calculate_obi,
     LargeTradeDetector, AbsorptionDetector,
-    OIDeltaTracker, LongShortRatioTracker, TakerBuySellRatio,
+    OIDeltaTracker, LongShortRatioTracker, FundingRateTracker, TakerBuySellRatio,
     CVDCalculator, VWAPDistance, CandleDelta, OrderFlowImbalance,
     calculate_book_depth, OrderBookElasticity, ATRExpansion,
     RealizedVolatility, VolumeSpikeDetector, VolatilityRatio,
@@ -110,6 +110,8 @@ class EngineMain:
         self.candle_delta = CandleDelta()
         self.oi = OIDeltaTracker(config.rest_url, config.symbol, config.oi_delta_window_sec)
         self.ls_ratio = LongShortRatioTracker(config.rest_url, config.symbol)
+        # v14.8: señal anticipativa de funding (predictedFundingFee via ticker REST)
+        self.funding = FundingRateTracker(config.rest_url, config.symbol)
         self.elasticity = OrderBookElasticity()
         self.atr = ATRExpansion()
         self.realized_vol = RealizedVolatility()
@@ -169,6 +171,11 @@ class EngineMain:
         # se extiende en bloques hasta entry+max_runner_duration_sec (1h).
         self._position_deadline = None
         self._extension_count = 0
+        # FIX v14.5: techo absoluto del runner como TIMESTAMP ABSOLUTO. Antes
+        # se calculaba como entry+hard_cap; para posiciones huerfanas restauradas
+        # (age inflado/0) eso podia quedar en el PASADO y desactivar toda
+        # extension, o permitir que una huerfana renaciera con 2h nuevas.
+        self._runner_hard_cap_ts = None
 
         self._last_loop_time = time.time()
         self._last_ws_message = time.time()
@@ -185,7 +192,7 @@ class EngineMain:
         # así detecta el loop en ejecución y monta uvicorn en él (no en un hilo
         # con otro loop -> era la causa del precio congelado).
         server_task = start_web_server()
-        print(f"\n🚀 BTC/USDT v14.0.1 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
+        print(f"\n🚀 BTC/USDT v14.8 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
         print(f"📊 25 señales (16 clásicas + 9 anticipativas) | Heartbeat + Emergencia ACTIVOS\n")
 
         subs = [f"orderbook.200.{self.cfg.symbol}",
@@ -378,6 +385,7 @@ class EngineMain:
             await self.rest.fetch_all()
             await self.oi.update(session_factory=self._get_session)
             await self.ls_ratio.update(session_factory=self._get_session)
+            await self.funding.update(session_factory=self._get_session)
             print(f"💰 Balance: ${self.rest.account_info.balance_usdt:,.2f}\n")
             while not stop_event.is_set():
                 await asyncio.sleep(self.cfg.rest_poll_sec)
@@ -387,6 +395,8 @@ class EngineMain:
                         self.oi.update(session_factory=self._get_session), timeout=5.0)
                     await asyncio.wait_for(
                         self.ls_ratio.update(session_factory=self._get_session), timeout=5.0)
+                    await asyncio.wait_for(
+                        self.funding.update(session_factory=self._get_session), timeout=5.0)
                 except asyncio.TimeoutError:
                     print("⏱️  Background poll timeout (no bloquea el loop principal)")
                 except Exception as e:
@@ -404,9 +414,43 @@ class EngineMain:
             self._entry_signals = None
             self._last_close_time = time.time()
         elif bybit_side != "None" and self._entry_time is None:
-            self._entry_time = time.time()
-            self._entry_price = self.rest.account_info.entry_price
+            # FIX v14.4 (huérfana): si Bybit tiene posición y el bot no (p. ej.
+            # reinicio del proceso con la posición abierta), se restauran los
+            # contadores internos usando el timestamp REAL de entrada del
+            # exchange (position_idx.updatedTime), no time.time(): poner now
+            # falseaba la duración (el runner/TIMEOUT contarían desde 0 aunque
+            # la posición llevara horas) y dejaba _position_deadline=None, lo
+            # que desactivaba silenciosamente las extensiones del runner
+            # (can_extend exige deadline no-None). Si el REST no da updatedTime
+            # (campo ausente/0) se usa now como último recurso.
+            entry_px = self.rest.account_info.entry_price or self.last_price
+            pos_ts = getattr(self.rest.account_info, "position_updated_ts", 0.0) or 0.0
+            now_r = time.time()
+            if pos_ts <= 0 or pos_ts > now_r + 5:
+                pos_ts = now_r   # sin dato fiable: empezar a contar ahora
+            # FIX v14.5 (huérfana >1h): updatedTime del exchange es el ultimo
+            # cambio de la posicion (parcial, TP/SL), no la hora de apertura;
+            # y si REST aun no lo ha rellenado (poll de 30s) caia en now ->
+            # duration=0. En ambos casos una huérfana de 2h renacia como recien
+            # abierta y el runner le regalaba hasta 2h nuevas. Techo honesto:
+            # una posición restaurada solo puede estirarse hasta
+            # max_runner_duration_sec DESDE la restauracion.
+            runner_cap_from = now_r
+            known_age = now_r - pos_ts
+            if known_age > self.cfg.max_runner_duration_sec:
+                # La posición ya nace mas alla del techo del runner: deadline
+                # inmediato -> se cierra por TIMEOUT en el siguiente tick.
+                self._position_deadline = now_r
+            else:
+                self._position_deadline = pos_ts + self.cfg.max_trade_duration_sec
+            self._runner_hard_cap_ts = runner_cap_from + self.cfg.max_runner_duration_sec
+            self._entry_time = pos_ts
+            self._entry_price = entry_px
             self._entry_side = bybit_side
+            self._extension_count = 0
+            sign_r = 1 if bybit_side == "Buy" else -1
+            self._max_favorable_move = max(
+                0.0, (self.last_price - entry_px) * sign_r)
 
     def _make_decision(self, d_out, a_out):
         # FIX v14.1 B1 (doble filtro de confianza INCONSISTENTE): `aligned` se
@@ -417,9 +461,18 @@ class EngineMain:
         # direccion NO NEUTRAL: wall_momentum/trade_arrival publican
         # max(conf,0.5) garantizado y una señal NEUTRAL con conf>=0.5 entraba
         # igual al conteo direccional (y podia activar strong_dir).
+        # FIX v14.7 (log 03:29-03:34): el conteo seguia inflado porque admitia
+        # señales DIRECCIONADAS pero CASI NEUTRAS (normalized ~0.02 con
+        # confidence sintetica >=0.5: wall_momentum/trade_arrival publican
+        # max(conf,0.5) garantizado). Con esas particulas el log mostraba
+        # "SHORT ali=6 ant=3" mientras px20s iba +11.9$ SUBIENDO (dir_score
+        # -0.50 era un espejo de reactivas tardias). Ahora solo cuentan las
+        # señales con FUERZA REAL: |normalized| >= dir_min_strength a favor.
+        _min_strength = getattr(self.cfg, "dir_min_strength", 0.25)
         active = [s for s in d_out.signals
                   if s.confidence >= self.cfg.min_signal_confidence
                   and s.direction != Direction.NEUTRAL
+                  and abs(s.normalized) >= _min_strength
                   and s.direction == d_out.direction]
         aligned = len(active)
         combined_score = abs(d_out.score) * min(aligned, 4) / 2
@@ -552,20 +605,29 @@ class EngineMain:
                      and _react_abs >= self.cfg.ambiguity_min_both
                      and abs(_ant_abs - _react_abs) < self.cfg.ambiguity_leader_margin)
 
-        # los scores colapsan a 0 -> HOLD natural. Pero si solo mueren las
-        # anticipativas (las reactivas REST siguen vivas), antes bastaba con
-        # 2 señales alineadas para abrir. Exigimos al menos UN precursor vivo
-        # en la misma dirección para abrir posición nueva.
-        # FIX v13.5: usamos bus.get_fresh() (edad REAL <= max_signal_age_sec).
-        # `s.timestamp` en Signal se fija al CREAR el objeto y muchas señales
-        # light se recalculan cada loop, pero las book-based (throttle 1s) y
-        # heavy (cvd/ofi/vwap, 2s) podían contar como "frescas" con 4-6s si el
-        # TTL era mayor -> aperturas sobre microestructura vieja.
-        fresh_map = self.bus.get_fresh(self.cfg.max_signal_age_sec)
+        # FIX v14.6 CRÍTICO (log 03:29-03:34): fresh_map se sacaba de
+        # get_fresh(max_signal_age_sec=4.0s), pero 3 de los 6 precursores se
+        # publican con THROTTLE DE 1s dentro del propio loop de ~2.5s: entre
+        # dos publicaciones su edad real es 2.5-3.5s y cruzaban el corte de
+        # 4s JUSTO A TIEMPO de no contar nunca. Resultado medido en el log:
+        # precursor_fresco(1<3) o (2<3) en ~90% de los ticks -> el bot casi
+        # jamás abría pese a dir=+0.77/-0.73 con 8 señales alineadas.
+        # Ahora la ventana de frescura del gate es max(signal_age,
+        # gate_window_sec) — suficiente para cubrir un ciclo de throttle sin
+        # dejar pasar microestructura realmente vieja.
+        _fresh_win = max(self.cfg.max_signal_age_sec,
+                         getattr(self.cfg, "fresh_gate_window_sec", 6.0))
+        fresh_map = self.bus.get_fresh(_fresh_win)
+        # FIX v14.7 (log 03:29-03:34): el gate de confluencia contaba señales
+        # frescas por `confidence`, pero wall_momentum/trade_arrival publican
+        # conf=max(conf,0.5) garantizado aunque su normalized sea ~0 -> el
+        # "ant=3" del log era en parte artano. Ahora se exige la MISMA fuerza
+        # minima (|normalized| >= dir_min_strength) que en `aligned`.
         fresh_anticip_aligned = sum(
             1 for name, s in fresh_map.items()
             if name in ANTICIP_DIR_WEIGHTS
             and s.confidence >= self.cfg.min_signal_confidence
+            and abs(s.normalized) >= _min_strength
             and s.direction == d_out.direction)
 
         # FIX v13.6 CRÍTICO (regla 1 del análisis de logs): la dirección FUERTE
@@ -652,6 +714,19 @@ class EngineMain:
             # precursores VIVOS y su edad máxima -> se distingue "no hay
             # microestructura" de "las señales light dejaron de publicarse".
             reasons.append(f"fa({feed_age_now:.1f}s)")
+            # FIX v14.6: registrar CUALES son los precursores que SI cuentan
+            # (antes era imposible auditar por qué el conteo saltaba 3->1).
+            # FIX v14.7: mismo filtro de fuerza |normalized| >= dir_min_strength
+            # que el gate real, para que la auditoria refleje el conteo exacto.
+            _cntd = [n for n, s in fresh_map.items()
+                     if n in ANTICIP_DIR_WEIGHTS
+                     and s.confidence >= self.cfg.min_signal_confidence
+                     and abs(s.normalized) >= _min_strength
+                     and s.direction == d_out.direction]
+            if len(_cntd) < self.cfg.min_fresh_anticip_signals:
+                _missing = sorted(set(ANTICIP_DIR_WEIGHTS) - set(_cntd))
+                reasons.append("ant_cnt[" + ",".join(_cntd) + "]")
+                reasons.append("ant_no[" + ",".join(_missing) + "]")
             _ant_alive = [n for n in fresh_map if n in ANTICIP_DIR_WEIGHTS]
             if not _ant_alive:
                 try:
@@ -737,8 +812,17 @@ class EngineMain:
             self._max_favorable_move = 0.0
             # FIX v14.2 (runner): deadline inicial = techo normal; se extiende
             # solo si la direccion sigue viva al vencerlo.
-            self._position_deadline = self._entry_time + cfg.max_trade_duration_sec
+            # FIX v14.3 G1 (NameError): esta linea se escribio usando `cfg`, pero
+            # `cfg = self.cfg` solo existe dentro de _trade_logic; en _open era un
+            # nombre libre -> NameError en CADA apertura: el bot nunca podia abrir
+            # posicion (ni automatica ni manual). El exception quedaba oculto por
+            # `except asyncio.TimeoutError` y el `finally` reseteaba _processing,
+            # asi que parecia "no opera" sin ningun mensaje.
+            self._position_deadline = self._entry_time + self.cfg.max_trade_duration_sec
             self._extension_count = 0
+            # FIX v14.5: techo del runner = entrada + hard_cap (absoluto).
+            self._runner_hard_cap_ts = (self._entry_time
+                                        + self.cfg.max_runner_duration_sec)
             self.rest.account_info.position_side = self._entry_side
             self.rest.account_info.entry_price = entry_price
             self.rest.account_info.position_size = order_size
@@ -766,11 +850,15 @@ class EngineMain:
             return
         self._processing = True
         self._processing_since = time.time()
+        # FIX v14.4: marca CLOSING (antes _close no cambiaba bot_state y el
+        # gate de /api/trade no podía detectar una orden de cierre en vuelo).
+        self.bot_state = "CLOSING"
         try:
             print(f"\n{'='*60}")
             print(f"🔴 CERRAR: {reason}")
             ok = await asyncio.wait_for(self.rest.close_position(), timeout=10.0)
             if not ok:
+                self.bot_state = "IN_POSITION"
                 return
             duration = max(0.0, time.time() - (self._entry_time or time.time()))
             d_sign = 1 if self._entry_side == "Buy" else -1
@@ -806,13 +894,16 @@ class EngineMain:
             self._entry_time = self._entry_price = self._entry_side = self._entry_signals = None
             self._position_deadline = None   # FIX v14.2 (runner)
             self._extension_count = 0        # FIX v14.2 (runner)
+            self._runner_hard_cap_ts = None  # FIX v14.5
             self._last_close_time = time.time()
             self._live_upnl = 0.0
             self._max_favorable_move = 0.0
             self.bot_state = "COOLDOWN"
             print(f"✅ CERRADA | Neto: {net:+.4f}")
         except asyncio.TimeoutError:
-            pass
+            # FIX v14.4: si el cierre timeout, NO dejar colgado "CLOSING" (el
+            # gate de /api/trade esperaría 3s en vano); restaurar estado real.
+            self.bot_state = "IN_POSITION" if self._entry_time else "IDLE"
         finally:
             self._processing = False
     async def _trade_logic(self, decision, dir_signals, d_score, a_score):
@@ -824,6 +915,10 @@ class EngineMain:
         pos = self.rest.account_info.position_side
 
         if bot_state.mode == "MANUAL":
+            # FIX v14.4 (mando de golpe): en MANUAL el botón LONG/SHORT/CERRAR se
+            # ejecuta YA: sin cooldown, sin gate de feed y SIN exigir que la
+            # decisión automática acompañe. Única protección: kill-switch de
+            # riesgo (se revalida dentro de _open) y spread extremo (_open).
             wanted = bot_state.position
             if wanted in ("LONG", "SHORT") and pos == "None" and self._entry_time is None:
                 await self._open(wanted, d_score, a_score, dir_signals, manual=True)
@@ -882,7 +977,7 @@ class EngineMain:
                     # cualquier señal viva con TTL largo (oi_delta vive 180s y
                     # falseaba el conteo -> cierres REVERSAL_ANT prematuros como
                     # el trade de 31s @ +0.014 USD que regaló la tendencia).
-                    fresh_map = self.bus.get_fresh(cfg.max_signal_age_sec)
+                    fresh_map = self.bus.get_fresh(max(cfg.max_signal_age_sec, cfg.fresh_gate_window_sec))  # FIX v14.6
                     opp_fresh = sum(
                         1 for name, s in fresh_map.items()
                         if s.direction == opposing
@@ -978,19 +1073,26 @@ class EngineMain:
             # (direccion en contra, ambigua o muerta; rally degradado; feed
             # muerto; techo alcanzado) cierra con TIMEOUT como antes.
             if duration >= cfg.max_trade_duration_sec:
-                hard_cap = cfg.max_runner_duration_sec
+                # FIX v14.5: el techo es un timestamp absoluto (valido tanto
+                # para aperturas propias como para huerfanas restauradas, cuyo
+                # _entry_time puede ser mentira). Con hard_cap=7200s el runner
+                # puede sostener la tesis VIVAMAS de 1 hora.
+                now_ext = time.time()
+                hard_cap_left = ((self._runner_hard_cap_ts - now_ext)
+                                 if self._runner_hard_cap_ts is not None
+                                 else (cfg.max_runner_duration_sec - duration))
                 can_extend = (cfg.use_direction_runner
                               and not feed_dead
-                              and duration < hard_cap
+                              and hard_cap_left > 1.0
                               and self._position_deadline is not None
-                              and time.time() >= self._position_deadline)
+                              and now_ext >= self._position_deadline)
                 extended = False
                 if can_extend:
                     same_dir = Direction.LONG if self._entry_side == "Buy" else Direction.SHORT
                     dec_dir_r = Direction.LONG if decision.action == "LONG" \
                         else (Direction.SHORT if decision.action == "SHORT" else Direction.NEUTRAL)
                     dir_with = abs(d_score) if ((d_score > 0) == (same_dir == Direction.LONG)) else 0.0
-                    fresh_map_r = self.bus.get_fresh(cfg.max_signal_age_sec)
+                    fresh_map_r = self.bus.get_fresh(max(cfg.max_signal_age_sec, cfg.fresh_gate_window_sec))  # FIX v14.6
                     ant_with = sum(1 for n, s in fresh_map_r.items()
                                    if n in ANTICIP_DIR_WEIGHTS
                                    and s.direction == same_dir
@@ -1009,7 +1111,9 @@ class EngineMain:
                     if thesis_ok and degrade_ok:
                         self._position_deadline = min(
                             self._position_deadline + cfg.extension_block_sec,
-                            self._entry_time + hard_cap)
+                            (self._runner_hard_cap_ts
+                             if self._runner_hard_cap_ts is not None
+                             else self._entry_time + cfg.max_runner_duration_sec))
                         self._extension_count += 1
                         extended = True
                         print(f"⏳ EXTENSION #{self._extension_count}: tesis viva "
@@ -1092,7 +1196,13 @@ class EngineMain:
         # distintas para lo mismo. Ahora es decision.expected_move_pct, que
         # desde esta version lleva los USD reales del gate C1.
         bot_state.expected_move = decision.expected_move_pct
-        bot_state.position = self.rest.account_info.position_side
+        # FIX v14.5: NO pisar el mando manual. En MANUAL, si el operador pulso
+        # LONG hace 200ms y la snapshot del loop corre antes de que _open
+        # termine, esto restauraba position="None" y el branch MANUAL de
+        # _trade_logic nunca veia el mando -> boton "ignorado". El mando vive
+        # hasta que el propio motor lo consume (_trade_logic / _close).
+        if bot_state.mode != "MANUAL":
+            bot_state.position = self.rest.account_info.position_side
         bot_state.bot_state = self.bot_state
         bot_state.last_signal = self.last_signal_summary
         acc = self.rest.account_info
@@ -1209,6 +1319,7 @@ class EngineMain:
                     try:
                         self._publish_sync(self.oi.calculate(self.last_price, change))
                         self._publish_sync(self.ls_ratio.calculate())
+                        self._publish_sync(self.funding.calculate())
                     except Exception:
                         pass
 
@@ -1376,6 +1487,7 @@ class EngineMain:
                     self._entry_side = None
                     self._position_deadline = None   # FIX v14.2 (runner)
                     self._extension_count = 0        # FIX v14.2 (runner)
+                    self._runner_hard_cap_ts = None  # FIX v14.5
                     self.bot_state = "COOLDOWN"
                     self._last_close_time = time.time()
                 except Exception as e:

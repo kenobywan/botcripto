@@ -92,6 +92,13 @@ class Config:
     min_amplitude_score: float = 0.30
     min_aligned_signals: int = 2
     min_signal_confidence: float = 0.40
+    # FIX v14.7 (log 03:29-03:34): fuerza minima REAL de una senal para contar
+    # en la confluencia (aligned / fresh_anticip). La confidence no basta:
+    # wall_momentum/trade_arrival publican conf=max(conf,0.5) garantizado
+    # aunque su normalized sea ~0.02 (ruido direccional). Sin este filtro el
+    # log mostraba "SHORT ali=6 ant=3" con px20s subiendo +11.9$ -> aperturas
+    # contra el movimiento real basadas en particulas casi neutras.
+    dir_min_strength: float = 0.25
 
     # FIX v14.1 D1: RiskManager NUNCA se instanciaba (modulo muerto). Parametros:
     use_risk_manager: bool = True
@@ -121,7 +128,12 @@ class Config:
     # max_runner_duration_sec (3600s). Con dir en contra o ambiguedad, el
     # TIMEOUT cierra como antes.
     use_direction_runner: bool = True
-    max_runner_duration_sec: float = 3600.0   # techo absoluto del runner (1h)
+    # FIX v14.5: "mas de 1 hora" exigia que el techo ABSOLUTO fuera >3600s.
+    # Con hard_cap=3600 la extension se calculaba como
+    # min(deadline+300, entry+3600): el ultimo bloque valia 0s y el runner
+    # moria clavado en 1h exacta. Ahora techo de 2h: una tesis viva puede
+    # sostenerse 1h05m...1h59m con bloques de 5min siempre utiles.
+    max_runner_duration_sec: float = 7200.0   # techo absoluto del runner (2h)
     extension_block_sec: float = 300.0        # cada bloque de extension (5 min)
     runner_min_dir_score: float = 0.25        # |d_score| a favor minimo para seguir
     runner_min_anticip_fresh: int = 2         # precursores anticipativos frescos a favor
@@ -136,6 +148,15 @@ class Config:
 
     # v13.3 Fresura de señales y salida por deterioro de tesis
     max_signal_age_sec: float = 4.0          # señal mas alla de esto NO cuenta como precursor
+    # FIX v14.6 CRITICO (log 03:29-03:34): los precursores de libro se
+    # publican con throttle de 1s dentro del loop (~2.5s/tick). Con corte de
+    # frescura = max_signal_age_sec(4s), entre dos publicaciones su edad real
+    # (2.5-3.5s) rozaba el corte y el conteo saltaba 3->1 en ~90% de los ticks
+    # -> el bot NUNCA abria pese a dir=+-0.7 con 8 senales alineadas.
+    # La ventana del gate de apertura/cierre/runner es ahora este valor
+    # (cubre un ciclo completo de throttle sin dejar pasar microestructura
+    # realmente vieja; sigue siendo <= TTL de las anticipativas = 6s).
+    fresh_gate_window_sec: float = 6.0
     min_fresh_anticip_signals: int = 3       # v14.0: CONFLUENCIA de >=3 precursores
                                              # anticipativos frescos y alineados para ABRIR
                                              # (con 1 el bot era reactivo disfrazado)

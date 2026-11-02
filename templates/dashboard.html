@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BTC/USDT Bot v14.0.1 — Control Center</title>
+<title>BTC/USDT Bot v14.8 — Control Center</title>
 <style>
   :root {
     --bg: #0a0e17; --panel: #111827; --border: #1f2a3d;
@@ -271,7 +271,7 @@
 <body>
 
 <header>
-  <h1>⚡ BTC/USDT <span>Engine v14.0.1</span></h1>
+  <h1>⚡ BTC/USDT <span>Engine v14.8</span></h1>
   <div class="header-right">
     <span class="pill"><i id="wsDot" class="dot"></i><span id="wsText">Conectando…</span></span>
     <span class="pill" id="lagPill" title="Latencia del feed de datos (tiempo desde el último tick)">lag —</span>
@@ -435,7 +435,9 @@
     <div class="control-block">
       <div class="block-title">⚙️ Control</div>
       <div class="btns">
-        <button id="btnAuto" onclick="setMode('AUTO')" class="active">🤖 AUTO</button>
+        <!-- FIX v14.3: sin clase "active" inicial: el bot arranca en MANUAL y
+             el estado real del boton se fija desde el snapshot (s.mode). -->
+        <button id="btnAuto" onclick="setMode('AUTO')">🤖 AUTO</button>
         <button id="btnManual" onclick="setMode('MANUAL')">👤 MANUAL</button>
       </div>
       <div class="btns">
@@ -798,7 +800,8 @@ function render(s) {
   // duración de posición: timestamp de apertura enviado por el bot
   posOpenedTs = s.position_opened_ts || 0;
 
-  const mode = s.mode || 'AUTO';
+  // FIX v14.3: el bot arranca en MANUAL -> el fallback del dashboard tambien.
+  const mode = s.mode || 'MANUAL';
   if (mode !== lastMode) {
     lastMode = mode;
     $('btnAuto').classList.toggle('active', mode === 'AUTO');
@@ -829,7 +832,9 @@ async function setMode(mode) {
 }
 
 async function trade(action) {
-  if(!confirm(`¿Ejecutar ${action} manualmente?`)) return;
+  // FIX v14.4: el mando manual se ejecuta DE GOLPE, sin ventana de confirmación emergente.
+  const btn = document.querySelector(`button[onclick*="${action}"]`);
+  if (btn) { btn.disabled = true; setTimeout(() => btn.disabled = false, 800); }
   try {
     const r = await fetch('/api/trade', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
     const j = await r.json();

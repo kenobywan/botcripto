@@ -85,6 +85,12 @@ class BybitRestClient:
                     self.account_info.position_side = p.get("side", "None")
                     self.account_info.position_size = size
                     self.account_info.entry_price = float(p.get("avgPrice", 0) or 0)
+                    # FIX v14.4: updatedTime (ms) del exchange -> época seg.
+                    try:
+                        self.account_info.position_updated_ts = \
+                            float(p.get("updatedTime", 0) or 0) / 1000.0
+                    except (TypeError, ValueError):
+                        self.account_info.position_updated_ts = 0.0
                     self.account_info.unrealized_pnl = float(p.get("unrealisedPnl", 0) or 0)
                     self.account_info.unrealized_pnl_pct = float(p.get("unrealisedPnlPct", 0) or 0) * 100
                     print(f"📈 Posición: {self.account_info.position_side} {size} BTC")

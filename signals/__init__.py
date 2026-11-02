@@ -5,7 +5,7 @@ from signals.directional import (
     calculate_obi,
     LargeTradeDetector, AbsorptionDetector,
     OIDeltaTracker,
-    LongShortRatioTracker, TakerBuySellRatio,
+    LongShortRatioTracker, FundingRateTracker, TakerBuySellRatio,
     CVDCalculator, VWAPDistance, CandleDelta, OrderFlowImbalance,
 )
 from signals.amplitude import (
@@ -23,7 +23,7 @@ __all__ = [
     "calculate_obi",
     "LargeTradeDetector", "AbsorptionDetector",
     "OIDeltaTracker",
-    "LongShortRatioTracker", "TakerBuySellRatio",
+    "LongShortRatioTracker", "FundingRateTracker", "TakerBuySellRatio",
     "CVDCalculator", "VWAPDistance", "CandleDelta", "OrderFlowImbalance",
     "calculate_book_depth",
     "OrderBookElasticity", "ATRExpansion",
