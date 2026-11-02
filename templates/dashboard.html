@@ -832,7 +832,9 @@ async function setMode(mode) {
 }
 
 async function trade(action) {
-  if(!confirm(`¿Ejecutar ${action} manualmente?`)) return;
+  // FIX v14.4: el mando manual se ejecuta DE GOLPE, sin ventana de confirmación emergente.
+  const btn = document.querySelector(`button[onclick*="${action}"]`);
+  if (btn) { btn.disabled = true; setTimeout(() => btn.disabled = false, 800); }
   try {
     const r = await fetch('/api/trade', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
     const j = await r.json();

@@ -48,6 +48,10 @@ class AccountInfo:
     position_side: str = "None"
     position_size: float = 0.0
     entry_price: float = 0.0
+    # FIX v14.4: timestamp (epoch seg) de la última actualización de la posición
+    # según el exchange (updatedTime). Lo usa _reconcile para restaurar la
+    # duración real de una posición huérfana tras reinicio del bot.
+    position_updated_ts: float = 0.0
     unrealized_pnl: float = 0.0
     unrealized_pnl_pct: float = 0.0
     session_trades: int = 0

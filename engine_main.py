@@ -404,9 +404,27 @@ class EngineMain:
             self._entry_signals = None
             self._last_close_time = time.time()
         elif bybit_side != "None" and self._entry_time is None:
-            self._entry_time = time.time()
-            self._entry_price = self.rest.account_info.entry_price
+            # FIX v14.4 (huérfana): si Bybit tiene posición y el bot no (p. ej.
+            # reinicio del proceso con la posición abierta), se restauran los
+            # contadores internos usando el timestamp REAL de entrada del
+            # exchange (position_idx.updatedTime), no time.time(): poner now
+            # falseaba la duración (el runner/TIMEOUT contarían desde 0 aunque
+            # la posición llevara horas) y dejaba _position_deadline=None, lo
+            # que desactivaba silenciosamente las extensiones del runner
+            # (can_extend exige deadline no-None). Si el REST no da updatedTime
+            # (campo ausente/0) se usa now como último recurso.
+            entry_px = self.rest.account_info.entry_price or self.last_price
+            pos_ts = getattr(self.rest.account_info, "position_updated_ts", 0.0) or 0.0
+            if pos_ts <= 0 or pos_ts > time.time() + 5:
+                pos_ts = time.time()   # sin dato fiable: empezar a contar ahora
+            self._entry_time = pos_ts
+            self._entry_price = entry_px
             self._entry_side = bybit_side
+            self._position_deadline = pos_ts + self.cfg.max_trade_duration_sec
+            self._extension_count = 0
+            sign_r = 1 if bybit_side == "Buy" else -1
+            self._max_favorable_move = max(
+                0.0, (self.last_price - entry_px) * sign_r)
 
     def _make_decision(self, d_out, a_out):
         # FIX v14.1 B1 (doble filtro de confianza INCONSISTENTE): `aligned` se
@@ -772,11 +790,15 @@ class EngineMain:
             return
         self._processing = True
         self._processing_since = time.time()
+        # FIX v14.4: marca CLOSING (antes _close no cambiaba bot_state y el
+        # gate de /api/trade no podía detectar una orden de cierre en vuelo).
+        self.bot_state = "CLOSING"
         try:
             print(f"\n{'='*60}")
             print(f"🔴 CERRAR: {reason}")
             ok = await asyncio.wait_for(self.rest.close_position(), timeout=10.0)
             if not ok:
+                self.bot_state = "IN_POSITION"
                 return
             duration = max(0.0, time.time() - (self._entry_time or time.time()))
             d_sign = 1 if self._entry_side == "Buy" else -1
@@ -818,7 +840,9 @@ class EngineMain:
             self.bot_state = "COOLDOWN"
             print(f"✅ CERRADA | Neto: {net:+.4f}")
         except asyncio.TimeoutError:
-            pass
+            # FIX v14.4: si el cierre timeout, NO dejar colgado "CLOSING" (el
+            # gate de /api/trade esperaría 3s en vano); restaurar estado real.
+            self.bot_state = "IN_POSITION" if self._entry_time else "IDLE"
         finally:
             self._processing = False
     async def _trade_logic(self, decision, dir_signals, d_score, a_score):
@@ -830,6 +854,10 @@ class EngineMain:
         pos = self.rest.account_info.position_side
 
         if bot_state.mode == "MANUAL":
+            # FIX v14.4 (mando de golpe): en MANUAL el botón LONG/SHORT/CERRAR se
+            # ejecuta YA: sin cooldown, sin gate de feed y SIN exigir que la
+            # decisión automática acompañe. Única protección: kill-switch de
+            # riesgo (se revalida dentro de _open) y spread extremo (_open).
             wanted = bot_state.position
             if wanted in ("LONG", "SHORT") and pos == "None" and self._entry_time is None:
                 await self._open(wanted, d_score, a_score, dir_signals, manual=True)

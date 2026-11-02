@@ -245,7 +245,27 @@ async def manual_trade(req: TradeRequest):
     if bot_state.mode != "MANUAL":
         return {"status": "error", "message": "Cambia a modo MANUAL primero"}
     if req.action in ["LONG", "SHORT", "CLOSE"]:
+        # FIX v14.4 (mando de golpe): el frontend YA no muestra confirmación
+        # emergente; aquí se fuerza la acción de INMEDIATO: si hay una orden
+        # en vuelo (ENTERING/CLOSING) se espera hasta 3s a que termine para
+        # no pisarla, y se invalida el cache de estado para que el panel
+        # refleje el mando en <100ms sin esperar al siguiente tick del bot.
+        for _ in range(30):
+            if bot_state.bot_state not in ("ENTERING", "CLOSING"):
+                break
+            await asyncio.sleep(0.1)
         bot_state.position = req.action
+        # FIX v14.4b: si el mando es LONG/SHORT pero YA existe posición real
+        # abierta (p. ej. huérfana tras reinicio), sincronizar con el lado
+        # real: sin esto, el branch MANUAL nunca cerraría (wanted != CLOSE y
+        # pos != None) y el operador vería su botón ignorado.
+        if req.action in ("LONG", "SHORT") and bot_state.account.position_side not in ("None", "", None):
+            real = "LONG" if bot_state.account.position_side == "Buy" else "SHORT"
+            bot_state.position = real
+            await broadcast_state()
+            return {"status": "ok", "position": real,
+                    "note": "ya habia posicion abierta; usa CERRAR"}
+        bot_state._state_dirty = True
         await broadcast_state()
         return {"status": "ok", "position": bot_state.position}
     return {"status": "error", "message": "Acción inválida"}
