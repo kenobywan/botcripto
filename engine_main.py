@@ -169,6 +169,11 @@ class EngineMain:
         # se extiende en bloques hasta entry+max_runner_duration_sec (1h).
         self._position_deadline = None
         self._extension_count = 0
+        # FIX v14.5: techo absoluto del runner como TIMESTAMP ABSOLUTO. Antes
+        # se calculaba como entry+hard_cap; para posiciones huerfanas restauradas
+        # (age inflado/0) eso podia quedar en el PASADO y desactivar toda
+        # extension, o permitir que una huerfana renaciera con 2h nuevas.
+        self._runner_hard_cap_ts = None
 
         self._last_loop_time = time.time()
         self._last_ws_message = time.time()
@@ -415,12 +420,28 @@ class EngineMain:
             # (campo ausente/0) se usa now como último recurso.
             entry_px = self.rest.account_info.entry_price or self.last_price
             pos_ts = getattr(self.rest.account_info, "position_updated_ts", 0.0) or 0.0
-            if pos_ts <= 0 or pos_ts > time.time() + 5:
-                pos_ts = time.time()   # sin dato fiable: empezar a contar ahora
+            now_r = time.time()
+            if pos_ts <= 0 or pos_ts > now_r + 5:
+                pos_ts = now_r   # sin dato fiable: empezar a contar ahora
+            # FIX v14.5 (huérfana >1h): updatedTime del exchange es el ultimo
+            # cambio de la posicion (parcial, TP/SL), no la hora de apertura;
+            # y si REST aun no lo ha rellenado (poll de 30s) caia en now ->
+            # duration=0. En ambos casos una huérfana de 2h renacia como recien
+            # abierta y el runner le regalaba hasta 2h nuevas. Techo honesto:
+            # una posición restaurada solo puede estirarse hasta
+            # max_runner_duration_sec DESDE la restauracion.
+            runner_cap_from = now_r
+            known_age = now_r - pos_ts
+            if known_age > self.cfg.max_runner_duration_sec:
+                # La posición ya nace mas alla del techo del runner: deadline
+                # inmediato -> se cierra por TIMEOUT en el siguiente tick.
+                self._position_deadline = now_r
+            else:
+                self._position_deadline = pos_ts + self.cfg.max_trade_duration_sec
+            self._runner_hard_cap_ts = runner_cap_from + self.cfg.max_runner_duration_sec
             self._entry_time = pos_ts
             self._entry_price = entry_px
             self._entry_side = bybit_side
-            self._position_deadline = pos_ts + self.cfg.max_trade_duration_sec
             self._extension_count = 0
             sign_r = 1 if bybit_side == "Buy" else -1
             self._max_favorable_move = max(
@@ -763,6 +784,9 @@ class EngineMain:
             # asi que parecia "no opera" sin ningun mensaje.
             self._position_deadline = self._entry_time + self.cfg.max_trade_duration_sec
             self._extension_count = 0
+            # FIX v14.5: techo del runner = entrada + hard_cap (absoluto).
+            self._runner_hard_cap_ts = (self._entry_time
+                                        + self.cfg.max_runner_duration_sec)
             self.rest.account_info.position_side = self._entry_side
             self.rest.account_info.entry_price = entry_price
             self.rest.account_info.position_size = order_size
@@ -834,6 +858,7 @@ class EngineMain:
             self._entry_time = self._entry_price = self._entry_side = self._entry_signals = None
             self._position_deadline = None   # FIX v14.2 (runner)
             self._extension_count = 0        # FIX v14.2 (runner)
+            self._runner_hard_cap_ts = None  # FIX v14.5
             self._last_close_time = time.time()
             self._live_upnl = 0.0
             self._max_favorable_move = 0.0
@@ -1012,12 +1037,19 @@ class EngineMain:
             # (direccion en contra, ambigua o muerta; rally degradado; feed
             # muerto; techo alcanzado) cierra con TIMEOUT como antes.
             if duration >= cfg.max_trade_duration_sec:
-                hard_cap = cfg.max_runner_duration_sec
+                # FIX v14.5: el techo es un timestamp absoluto (valido tanto
+                # para aperturas propias como para huerfanas restauradas, cuyo
+                # _entry_time puede ser mentira). Con hard_cap=7200s el runner
+                # puede sostener la tesis VIVAMAS de 1 hora.
+                now_ext = time.time()
+                hard_cap_left = ((self._runner_hard_cap_ts - now_ext)
+                                 if self._runner_hard_cap_ts is not None
+                                 else (cfg.max_runner_duration_sec - duration))
                 can_extend = (cfg.use_direction_runner
                               and not feed_dead
-                              and duration < hard_cap
+                              and hard_cap_left > 1.0
                               and self._position_deadline is not None
-                              and time.time() >= self._position_deadline)
+                              and now_ext >= self._position_deadline)
                 extended = False
                 if can_extend:
                     same_dir = Direction.LONG if self._entry_side == "Buy" else Direction.SHORT
@@ -1043,7 +1075,9 @@ class EngineMain:
                     if thesis_ok and degrade_ok:
                         self._position_deadline = min(
                             self._position_deadline + cfg.extension_block_sec,
-                            self._entry_time + hard_cap)
+                            (self._runner_hard_cap_ts
+                             if self._runner_hard_cap_ts is not None
+                             else self._entry_time + cfg.max_runner_duration_sec))
                         self._extension_count += 1
                         extended = True
                         print(f"⏳ EXTENSION #{self._extension_count}: tesis viva "
@@ -1126,7 +1160,13 @@ class EngineMain:
         # distintas para lo mismo. Ahora es decision.expected_move_pct, que
         # desde esta version lleva los USD reales del gate C1.
         bot_state.expected_move = decision.expected_move_pct
-        bot_state.position = self.rest.account_info.position_side
+        # FIX v14.5: NO pisar el mando manual. En MANUAL, si el operador pulso
+        # LONG hace 200ms y la snapshot del loop corre antes de que _open
+        # termine, esto restauraba position="None" y el branch MANUAL de
+        # _trade_logic nunca veia el mando -> boton "ignorado". El mando vive
+        # hasta que el propio motor lo consume (_trade_logic / _close).
+        if bot_state.mode != "MANUAL":
+            bot_state.position = self.rest.account_info.position_side
         bot_state.bot_state = self.bot_state
         bot_state.last_signal = self.last_signal_summary
         acc = self.rest.account_info
@@ -1410,6 +1450,7 @@ class EngineMain:
                     self._entry_side = None
                     self._position_deadline = None   # FIX v14.2 (runner)
                     self._extension_count = 0        # FIX v14.2 (runner)
+                    self._runner_hard_cap_ts = None  # FIX v14.5
                     self.bot_state = "COOLDOWN"
                     self._last_close_time = time.time()
                 except Exception as e:

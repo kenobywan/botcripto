@@ -250,8 +250,15 @@ async def manual_trade(req: TradeRequest):
         # en vuelo (ENTERING/CLOSING) se espera hasta 3s a que termine para
         # no pisarla, y se invalida el cache de estado para que el panel
         # refleje el mando en <100ms sin esperar al siguiente tick del bot.
+        # FIX v14.5: antes se esperaba a que bot_state.bot_state saliera de
+        # ENTERING/CLOSING, pero esos estados viven en BotRunner.self.bot_state y
+        # solo se propagaban al final del tick -> el bucle era decorativo y un
+        # mando podia pisar una orden en vuelo. Ahora se consulta al runner real.
+        runner = getattr(bot_state, "_runner", None)
         for _ in range(30):
-            if bot_state.bot_state not in ("ENTERING", "CLOSING"):
+            busy = bool(getattr(runner, "_processing", False)) \
+                or getattr(runner, "bot_state", "") in ("ENTERING", "CLOSING")
+            if not busy:
                 break
             await asyncio.sleep(0.1)
         bot_state.position = req.action

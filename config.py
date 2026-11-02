@@ -121,7 +121,12 @@ class Config:
     # max_runner_duration_sec (3600s). Con dir en contra o ambiguedad, el
     # TIMEOUT cierra como antes.
     use_direction_runner: bool = True
-    max_runner_duration_sec: float = 3600.0   # techo absoluto del runner (1h)
+    # FIX v14.5: "mas de 1 hora" exigia que el techo ABSOLUTO fuera >3600s.
+    # Con hard_cap=3600 la extension se calculaba como
+    # min(deadline+300, entry+3600): el ultimo bloque valia 0s y el runner
+    # moria clavado en 1h exacta. Ahora techo de 2h: una tesis viva puede
+    # sostenerse 1h05m...1h59m con bloques de 5min siempre utiles.
+    max_runner_duration_sec: float = 7200.0   # techo absoluto del runner (2h)
     extension_block_sec: float = 300.0        # cada bloque de extension (5 min)
     runner_min_dir_score: float = 0.25        # |d_score| a favor minimo para seguir
     runner_min_anticip_fresh: int = 2         # precursores anticipativos frescos a favor
