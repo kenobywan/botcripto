@@ -1,5 +1,5 @@
 """
-EngineMain v14.0.1 - Anticipacion real: horizonte 30-60s + confluencia >=3 precursores
+EngineMain v14.5 - Anticipacion real: horizonte 30-60s + confluencia >=3 precursores
   - Bloque ANTICIPATIVO dirección (6): book_slope, wall_momentum, ofi_weighted,
     micro_price_dev, cvd_divergence, trade_arrival
   - Bloque ANTICIPATIVO amplitud (3): liquidity_thinning, spread_compression,
@@ -190,7 +190,7 @@ class EngineMain:
         # así detecta el loop en ejecución y monta uvicorn en él (no en un hilo
         # con otro loop -> era la causa del precio congelado).
         server_task = start_web_server()
-        print(f"\n🚀 BTC/USDT v14.0.1 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
+        print(f"\n🚀 BTC/USDT v14.5 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
         print(f"📊 25 señales (16 clásicas + 9 anticipativas) | Heartbeat + Emergencia ACTIVOS\n")
 
         subs = [f"orderbook.200.{self.cfg.symbol}",
