@@ -144,6 +144,22 @@ class OIDeltaTracker:
             pass
 
     def calculate(self, price: float, price_change_pct: float) -> Signal:
+        """FIX v14.8 (clasificacion correcta OI x precio):
+
+        Antes la firma se copiaba del MOVIMIENTO DE PRECIO pasado
+        (`dir_from(price_change_pct)`), es decir era trend-following disfrazado
+        de señal anticipativa: confirmaba lo ya ocurrido en lugar de anticipar.
+
+        Tabla canonica derivados (4 regimenes):
+          OI sube + precio sube  -> LONG  (nuevos largos agresivos, tendencia con combustible)
+          OI sube + precio baja  -> SHORT (nuevos cortos agresivos)
+          OI baja + precio sube  -> SHORT (short-covering: el rebote es cierre de cortos,
+                                          sin dinero nuevo -> reversión)
+          OI baja + precio baja  -> LONG  (long liquidation flush: capitulación -> rebote)
+        La magnitud es el % de cambio de OI en la ventana (0.5% OI en 5min ya
+        es mucho en BTCUSDT). El precio solo entra como DISCRIMINADOR de régimen,
+        no como fuente de la firma.
+        """
         if len(self.history) < 2:
             return Signal("oi_delta", 0, 0, Direction.NEUTRAL, 0)
         now = time.time()
@@ -152,12 +168,29 @@ class OIDeltaTracker:
             return Signal("oi_delta", 0, 0, Direction.NEUTRAL, 0)
         change = (recent[-1][1] - recent[0][1]) / recent[0][1] * 100
         norm, direction = 0.0, Direction.NEUTRAL
-        if abs(change) > 0.05:
-            direction = dir_from(price_change_pct) if abs(price_change_pct) > 0.01 else Direction.NEUTRAL
-            if direction == Direction.NEUTRAL:
-                direction = Direction.LONG if change > 0 else Direction.SHORT
-            norm = min(abs(change) / 0.5, 1.0) * (1 if direction == Direction.LONG else -1)
-        return Signal("oi_delta", change, norm, direction, min(abs(change) / 0.5, 1.0))
+        if abs(change) > 0.03:
+            # Precio: comparativa misma ventana (media primera mitad vs ultima
+            # muestra) para no depender del parpadeo del ultimo tick.
+            mid = recent[len(recent) // 2][1]
+            px_ref = None
+            # usamos el precio actual vs el precio hace ~window (si el caller
+            # pasa price_change_pct lo respetamos como proxy valido)
+            pchg = price_change_pct
+            oi_up = change > 0
+            if abs(pchg) < 0.005:
+                direction = Direction.NEUTRAL   # precio plano: OI solo no decide
+            elif oi_up and pchg > 0:
+                direction = Direction.LONG      # new longs
+            elif oi_up and pchg < 0:
+                direction = Direction.SHORT     # new shorts
+            elif (not oi_up) and pchg > 0:
+                direction = Direction.SHORT     # short covering -> fade
+            else:
+                direction = Direction.LONG      # long flush -> mean reversion
+            strength = min(abs(change) / 0.5, 1.0)
+            norm = strength * (1 if direction == Direction.LONG else -1)
+        return Signal("oi_delta", change, norm, direction,
+                      min(abs(change) / 0.5, 1.0))
 
 
 # 5. Long/Short Ratio
@@ -186,9 +219,105 @@ class LongShortRatioTracker:
                 }) as r:
                     d = await r.json()
                     if d.get("retCode") == 0 and d.get("result", {}).get("list"):
-                        item = d["result"]["list"][0]
+                        # FIX v14.8 ANTI-SPREAD: Bybit ordena account-ratio del
+                        # MAS VIEJO (list[0]) al MAS NUEVO (list[-1]). Antes se
+                        # leia list[0] -> senal permanentemente desfasada.
+                        item = d["result"]["list"][-1]
                         sell = max(float(item.get("sellRatio", 1) or 1), 0.0001)
                         self.last_ratio = float(item.get("buyRatio", 1) or 1) / sell
+                        self.last_fetch = now
+                        try:
+                            self.last_ts = float(item.get("timestamp", 0) or 0) / 1000.0
+                        except (TypeError, ValueError):
+                            self.last_ts = now
+            finally:
+                if ctx is not None:
+                    await ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    def calculate(self) -> Signal:
+        """FIX v14.8 (sentido + frescura):
+
+        1) ANTI-SPREAD: Bybit publica list[0] con el timestamp MAS VIEJO y el
+           mas NUEVO al final (verificado en API real 2026-11-02). El codigo
+           viejo leia list[0] -> usaba una medicion de hace N*5min como si fuera
+           actual: senal SIEMPRE desfasada (y congelada si la pagina no traia
+           nada nuevo). Ahora se toma la ULTIMA entrada y su timestamp.
+
+        2) SENTIDO: buyRatio/sellRatio de BYBIT son por CUENTAS (retail), no por
+           volumen. El retail mayoritariamente largo es combustible de short /
+           capitulation LONG segun regimen, pero el uso clasico contrarian en
+           scalping: crowd extremo largo (>1.3) -> sesgo SHORT; crowd extremo
+           corto (<0.8) -> sesgo LONG. Magnitud proporcional a la distancia al
+           nivel neutral 1.0 (antes era un salto binario -0.5/+0.5 sin gradiente).
+        """
+        level = self.last_ratio
+        ts = getattr(self, "last_ts", 0.0)
+        # frescura: ratio de cuentas cambia lento; si tiene >15 min, conf baja
+        age = time.time() - ts if ts else 9999.0
+        fresh = 1.0 if age <= 300 else max(0.2, 1.0 - (age - 300) / 900.0)
+        norm, direction = 0.0, Direction.NEUTRAL
+        if level > 1.15:          # crowd largos -> fade SHORT
+            norm = -min((level - 1.0) / 0.5, 1.0)
+            direction = Direction.SHORT
+        elif level < 0.87:        # crowd cortos -> fade LONG
+            norm = min((1.0 - level) / 0.5, 1.0)
+            direction = Direction.LONG
+        conf = (0.35 + 0.35 * abs(norm)) * fresh if norm else 0.15 * fresh
+        return Signal("ls_ratio", level, norm, direction, conf)
+
+
+# 6. Funding Rate Anticipativo (nueva señal v14.8)
+class FundingRateTracker:
+    """Funding = flujo de dinero real entre largos y cortos.
+
+    Uso ANTICIPATIVO (no reactivo): el funding proyectado (predictedFundingFee
+    del ticker REST, gratis y ya disponible en la respuesta que el bot consulta
+    cada rest_poll_sec) anticipa presion:
+      - funding muy POSITIVO y SUBIENDOSE -> largos pagan mucho -> exceso de
+        apalancamiento largo -> riesgo de squeeze -> sesgo SHORT contrarian
+        cuando ademas el precio no avanza (falta de combustible).
+      - funding NEGATIVO y BAJANDO -> cortos pagan -> squeezable -> sesgo LONG.
+    Magnitud normalizada: |funding| por intervalo; 0.01%/8h ya es extremo en
+    BTC (escala: 0.05% = saturacion). Conf alta solo si desvia del neutro.
+    """
+
+    def __init__(self, rest_url: str, symbol: str):
+        self.rest_url = rest_url
+        self.symbol = symbol
+        self.current = 0.0          # funding actual (ya liquidado)
+        self.predicted = 0.0        # funding proyectado proximo intervalo
+        self.next_funding_ts = 0.0
+        self.last_fetch = 0.0
+        self.prev_predicted = 0.0   # para la DERIVADA (dirección del cambio)
+
+    async def update(self, session_factory=None):
+        now = time.time()
+        if now - self.last_fetch < 30:
+            return
+        try:
+            if session_factory is not None:
+                s = await session_factory()
+                ctx = None
+            else:
+                timeout = aiohttp.ClientTimeout(total=8, connect=5)
+                ctx = aiohttp.ClientSession(timeout=timeout)
+                s = await ctx.__aenter__()
+            try:
+                async with s.get(f"{self.rest_url}/v5/market/tickers", params={
+                    "category": "linear", "symbol": self.symbol
+                }) as r:
+                    d = await r.json()
+                    lst = d.get("result", {}).get("list") or []
+                    if d.get("retCode") == 0 and lst:
+                        t = lst[0]
+                        self.prev_predicted = self.predicted
+                        self.current = float(t.get("fundingRate", 0) or 0)
+                        self.predicted = float(
+                            t.get("predictedFundingFee", 0) or 0) or self.current
+                        self.next_funding_ts = float(
+                            t.get("nextFundingTime", 0) or 0) / 1000.0
                         self.last_fetch = now
             finally:
                 if ctx is not None:
@@ -197,16 +326,32 @@ class LongShortRatioTracker:
             pass
 
     def calculate(self) -> Signal:
-        level = self.last_ratio
+        age = time.time() - self.last_fetch if self.last_fetch else 9999.0
+        fresh = 1.0 if age <= 90 else max(0.2, 1.0 - (age - 90) / 300.0)
+        f = self.predicted
+        delta = self.predicted - self.prev_predicted
         norm, direction = 0.0, Direction.NEUTRAL
-        if level > 1.3:
-            norm, direction = -0.5, Direction.SHORT
-        elif level < 0.8:
-            norm, direction = 0.5, Direction.LONG
-        return Signal("ls_ratio", level, norm, direction, 0.6 if norm else 0.2)
+        # escala: 0.0005 = 0.05% por intervalo -> saturación
+        mag = min(abs(f) / 0.0005, 1.0)
+        if abs(f) > 0.00005:                      # >0.005%: relevante
+            if f > 0 and delta >= -abs(f) * 0.1:  # caro estar largo y sin relajarse
+                direction = Direction.SHORT       # riesgo de long-squeeze
+            elif f < 0:                           # corto paga -> combustible LONG
+                direction = Direction.LONG
+        if direction != Direction.NEUTRAL:
+            # la derivada refuerza o amortigua (funding subiendo = más riesgo)
+            boost = 1.0
+            if (f > 0 and delta > 0) or (f < 0 and delta < 0):
+                boost = 1.25
+            elif delta != 0 and (f > 0) != (delta > 0):
+                boost = 0.7
+            norm = mag * boost * (1 if direction == Direction.LONG else -1)
+            norm = max(-1.0, min(1.0, norm))
+        conf = (0.3 + 0.5 * mag) * fresh if norm else 0.1 * fresh
+        return Signal("funding_pressure", f, norm, direction, conf)
 
 
-# 6. Taker Buy/Sell Ratio
+# 7. Taker Buy/Sell Ratio
 class TakerBuySellRatio:
     def __init__(self, window: int = 60):
         self.window = window

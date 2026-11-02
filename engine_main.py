@@ -1,5 +1,5 @@
 """
-EngineMain v14.7 - Anticipacion real: horizonte 30-60s + confluencia >=3 precursores (fuerza minima |norm|>=0.25)
+EngineMain v14.8 - + senal anticipativa funding_pressure, oi_delta reclasificada (tabla OI x precio), ls_ratio anti-spread
   - Bloque ANTICIPATIVO dirección (6): book_slope, wall_momentum, ofi_weighted,
     micro_price_dev, cvd_divergence, trade_arrival
   - Bloque ANTICIPATIVO amplitud (3): liquidity_thinning, spread_compression,
@@ -74,7 +74,7 @@ from rest_client import BybitRestClient
 from signals import (
     calculate_obi,
     LargeTradeDetector, AbsorptionDetector,
-    OIDeltaTracker, LongShortRatioTracker, TakerBuySellRatio,
+    OIDeltaTracker, LongShortRatioTracker, FundingRateTracker, TakerBuySellRatio,
     CVDCalculator, VWAPDistance, CandleDelta, OrderFlowImbalance,
     calculate_book_depth, OrderBookElasticity, ATRExpansion,
     RealizedVolatility, VolumeSpikeDetector, VolatilityRatio,
@@ -110,6 +110,8 @@ class EngineMain:
         self.candle_delta = CandleDelta()
         self.oi = OIDeltaTracker(config.rest_url, config.symbol, config.oi_delta_window_sec)
         self.ls_ratio = LongShortRatioTracker(config.rest_url, config.symbol)
+        # v14.8: señal anticipativa de funding (predictedFundingFee via ticker REST)
+        self.funding = FundingRateTracker(config.rest_url, config.symbol)
         self.elasticity = OrderBookElasticity()
         self.atr = ATRExpansion()
         self.realized_vol = RealizedVolatility()
@@ -190,7 +192,7 @@ class EngineMain:
         # así detecta el loop en ejecución y monta uvicorn en él (no en un hilo
         # con otro loop -> era la causa del precio congelado).
         server_task = start_web_server()
-        print(f"\n🚀 BTC/USDT v14.7 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
+        print(f"\n🚀 BTC/USDT v14.8 | {'DEMO' if self.cfg.demo_mode else 'LIVE'}")
         print(f"📊 25 señales (16 clásicas + 9 anticipativas) | Heartbeat + Emergencia ACTIVOS\n")
 
         subs = [f"orderbook.200.{self.cfg.symbol}",
@@ -383,6 +385,7 @@ class EngineMain:
             await self.rest.fetch_all()
             await self.oi.update(session_factory=self._get_session)
             await self.ls_ratio.update(session_factory=self._get_session)
+            await self.funding.update(session_factory=self._get_session)
             print(f"💰 Balance: ${self.rest.account_info.balance_usdt:,.2f}\n")
             while not stop_event.is_set():
                 await asyncio.sleep(self.cfg.rest_poll_sec)
@@ -392,6 +395,8 @@ class EngineMain:
                         self.oi.update(session_factory=self._get_session), timeout=5.0)
                     await asyncio.wait_for(
                         self.ls_ratio.update(session_factory=self._get_session), timeout=5.0)
+                    await asyncio.wait_for(
+                        self.funding.update(session_factory=self._get_session), timeout=5.0)
                 except asyncio.TimeoutError:
                     print("⏱️  Background poll timeout (no bloquea el loop principal)")
                 except Exception as e:
@@ -1314,6 +1319,7 @@ class EngineMain:
                     try:
                         self._publish_sync(self.oi.calculate(self.last_price, change))
                         self._publish_sync(self.ls_ratio.calculate())
+                        self._publish_sync(self.funding.calculate())
                     except Exception:
                         pass
 

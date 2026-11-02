@@ -20,6 +20,8 @@ class SignalBus:
         # reactivas de ventana larga / REST lento
         "cvd": 10.0, "vwap_distance": 10.0, "candle_delta": 10.0,
         "oi_delta": 180.0, "ls_ratio": 180.0,
+        # v14.8: funding cambia cada 30s (poll) y es estructura lenta -> TTL largo
+        "funding_pressure": 180.0,
         # anticipativas de libro/trade: vida corta (son de SEGUNDOS)
         "ofi_weighted": 6.0, "micro_price_dev": 6.0, "book_slope": 6.0,
         "wall_momentum": 6.0, "trade_arrival": 6.0, "cvd_divergence": 10.0,
@@ -110,25 +112,28 @@ class SignalBus:
 
 # ------------------------- agrupación por horizonte -------------------------
 ANTICIP_DIR_WEIGHTS: Dict[str, float] = {
-    "micro_price_dev": 0.22,
-    "ofi_weighted": 0.20,
-    "book_slope": 0.14,
-    "wall_momentum": 0.12,
-    "trade_arrival": 0.16,
-    "cvd_divergence": 0.16,
+    "micro_price_dev": 0.21,
+    "ofi_weighted": 0.19,
+    "book_slope": 0.13,
+    "wall_momentum": 0.11,
+    "trade_arrival": 0.15,
+    "cvd_divergence": 0.14,
+    # v14.8: funding proyectado (REST, lento pero genuinamente anticipativo:
+    # desequilibrio de apalancamiento -> squeeze antes del movimiento)
+    "funding_pressure": 0.07,
 }
 
 REACT_DIR_WEIGHTS: Dict[str, float] = {
-    "cvd": 0.17,
-    "taker_ratio": 0.12,
-    "large_trades": 0.12,
-    "absorption": 0.12,
-    "order_flow_imb": 0.10,
-    "obi_anti_spoof": 0.09,
-    "candle_delta": 0.08,
-    "oi_delta": 0.08,
-    "ls_ratio": 0.05,
-    "vwap_distance": 0.07,
+    "cvd": 0.16,
+    "taker_ratio": 0.11,
+    "large_trades": 0.11,
+    "absorption": 0.11,
+    "order_flow_imb": 0.09,
+    "obi_anti_spoof": 0.08,
+    "candle_delta": 0.07,
+    "oi_delta": 0.09,
+    "ls_ratio": 0.09,
+    "vwap_distance": 0.06,
 }
 
 ANTICIP_AMP_WEIGHTS: Dict[str, float] = {
