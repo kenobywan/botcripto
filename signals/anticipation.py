@@ -142,6 +142,12 @@ class WallMomentum:
         # FIX A4b: acumulador entre ventanas de polling
         self._pend_gb = self._pend_sb = 0.0
         self._pend_ga = self._pend_sa = 0.0
+        # FIX v14.7 (log 03:29-03:34): sin base, la PRIMERA lectura compara los
+        # muros actuales contra {} -> "crecimiento" fantasma de TODO el muro
+        # visible (norm saturado). Ahora la primera lectura fija base y emite
+        # neutro; además se renueva base tras huecos >5s (reconexión WS) para no
+        # inventar crecimiento con liquidez nueva post-corte.
+        self._primed = False
 
     @staticmethod
     def _diff(cur: Dict[float, float], prev: Dict[float, float],
@@ -171,6 +177,18 @@ class WallMomentum:
         bids, asks = _sides(book, 30)
         wb = {p: q for p, q in bids if q >= self.min_wall}
         wa = {p: q for p, q in asks if q >= self.min_wall}
+        # FIX v14.7: primera lectura (o tras hueco de feed >5s): fijar base sin
+        # puntuar. Sin esto, el arranque del bot emitía wall_momentum saturado
+        # inventado ("todos los muros acaban de crecer") que sesgaba el bloque
+        # anticipativo durante los primeros ticks y contaminaba el conteo de
+        # precursores frescos del gate de apertura.
+        gap = now - self._last_ts if self._last_ts else 0.0
+        if not self._primed or gap > 5.0:
+            self._prev_b, self._prev_a = wb, wa
+            self._pend_gb = self._pend_sb = self._pend_ga = self._pend_sa = 0.0
+            self._last_ts = now
+            self._primed = True
+            return Signal("wall_momentum", 0, 0, Direction.NEUTRAL, 0.5)
         gb, sb = self._diff(wb, self._prev_b)
         ga, sa = self._diff(wa, self._prev_a)
         self._prev_b, self._prev_a = wb, wa
@@ -326,6 +344,15 @@ class WeightedOFI:
         self._prev_b, self._prev_a = cb, ca
 
         dt = max(now - self._last_ts, 1e-6) if self._last_ts else 1.0
+        # FIX v14.7 (log 03:29-03:34): tras un hueco de feed >5s (reconexión WS,
+        # micro-corte) los deltas comparan contra una base obsoleta y fabrican
+        # "cancel/add masivo" fantasma; además `raw` se acumulaba en
+        # _pending_raw SIN decaer durante el hueco -> arrancaba saturado. Se
+        # renueva la base, se purga el pending y se emite neutro este tick.
+        if dt > 5.0:
+            self.reset_baseline(cb, ca)
+            self._last_ts = now
+            return Signal("ofi_weighted", 0, 0, Direction.NEUTRAL, 0.2)
         self._last_ts = now
         alpha = 1 - 0.5 ** (dt / self.half_life)
         raw = near_ofi + 0.3 * deep_ofi
@@ -423,6 +450,12 @@ class CVDDivergence:
         # la medida es el delta del ULTIMO paso de 3s.
         self._sample_every = 3.0
         self._last_sample_ts = 0.0
+        # FIX v14.7 (log 03:29-03:34): el gate de apertura contaba esta señal
+        # como "precursor fresco alineado" aunque su confidence era ~0 (no hay
+        # divergencia). En engine_main se exige ahora conf>=0.40 Y |norm|>=0.25
+        # para contarla; aquí solo se purga el historial tras huecos de feed
+        # >60s (reconexión) para no mezclar pasos de dos sesiones en el z-score.
+        self._last_calc_ts = 0.0
 
     def add_trade(self, ts: float, price: float, qty: float, maker: bool):
         prev_cvd = self.cvd_hist[-1][1] if self.cvd_hist else 0.0
@@ -432,6 +465,15 @@ class CVDDivergence:
 
     def calculate(self) -> Signal:
         now = time.time()
+        # FIX v14.7: tras un corte largo del feed, _delta_hist/ventanas mezclan
+        # datos pre y post reconexión (step_dc entre sesiones -> z fantasma).
+        if self._last_calc_ts and now - self._last_calc_ts > 60.0:
+            self.cvd_hist.clear()
+            self.price_hist.clear()
+            self._delta_hist.clear()
+            self._mean_d, self._var_d = 0.0, 1.0
+            self._last_sample_ts = 0.0
+        self._last_calc_ts = now
         c = [(t, v) for t, v in self.cvd_hist if t >= now - self.window]
         p = [(t, v) for t, v in self.price_hist if t >= now - self.window]
         if len(c) < 10 or len(p) < 10:
