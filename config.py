@@ -141,6 +141,15 @@ class Config:
 
     # v13.3 Fresura de señales y salida por deterioro de tesis
     max_signal_age_sec: float = 4.0          # señal mas alla de esto NO cuenta como precursor
+    # FIX v14.6 CRITICO (log 03:29-03:34): los precursores de libro se
+    # publican con throttle de 1s dentro del loop (~2.5s/tick). Con corte de
+    # frescura = max_signal_age_sec(4s), entre dos publicaciones su edad real
+    # (2.5-3.5s) rozaba el corte y el conteo saltaba 3->1 en ~90% de los ticks
+    # -> el bot NUNCA abria pese a dir=+-0.7 con 8 senales alineadas.
+    # La ventana del gate de apertura/cierre/runner es ahora este valor
+    # (cubre un ciclo completo de throttle sin dejar pasar microestructura
+    # realmente vieja; sigue siendo <= TTL de las anticipativas = 6s).
+    fresh_gate_window_sec: float = 6.0
     min_fresh_anticip_signals: int = 3       # v14.0: CONFLUENCIA de >=3 precursores
                                              # anticipativos frescos y alineados para ABRIR
                                              # (con 1 el bot era reactivo disfrazado)

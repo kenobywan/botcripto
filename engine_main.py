@@ -591,16 +591,19 @@ class EngineMain:
                      and _react_abs >= self.cfg.ambiguity_min_both
                      and abs(_ant_abs - _react_abs) < self.cfg.ambiguity_leader_margin)
 
-        # los scores colapsan a 0 -> HOLD natural. Pero si solo mueren las
-        # anticipativas (las reactivas REST siguen vivas), antes bastaba con
-        # 2 señales alineadas para abrir. Exigimos al menos UN precursor vivo
-        # en la misma dirección para abrir posición nueva.
-        # FIX v13.5: usamos bus.get_fresh() (edad REAL <= max_signal_age_sec).
-        # `s.timestamp` en Signal se fija al CREAR el objeto y muchas señales
-        # light se recalculan cada loop, pero las book-based (throttle 1s) y
-        # heavy (cvd/ofi/vwap, 2s) podían contar como "frescas" con 4-6s si el
-        # TTL era mayor -> aperturas sobre microestructura vieja.
-        fresh_map = self.bus.get_fresh(self.cfg.max_signal_age_sec)
+        # FIX v14.6 CRÍTICO (log 03:29-03:34): fresh_map se sacaba de
+        # get_fresh(max_signal_age_sec=4.0s), pero 3 de los 6 precursores se
+        # publican con THROTTLE DE 1s dentro del propio loop de ~2.5s: entre
+        # dos publicaciones su edad real es 2.5-3.5s y cruzaban el corte de
+        # 4s JUSTO A TIEMPO de no contar nunca. Resultado medido en el log:
+        # precursor_fresco(1<3) o (2<3) en ~90% de los ticks -> el bot casi
+        # jamás abría pese a dir=+0.77/-0.73 con 8 señales alineadas.
+        # Ahora la ventana de frescura del gate es max(signal_age,
+        # gate_window_sec) — suficiente para cubrir un ciclo de throttle sin
+        # dejar pasar microestructura realmente vieja.
+        _fresh_win = max(self.cfg.max_signal_age_sec,
+                         getattr(self.cfg, "fresh_gate_window_sec", 6.0))
+        fresh_map = self.bus.get_fresh(_fresh_win)
         fresh_anticip_aligned = sum(
             1 for name, s in fresh_map.items()
             if name in ANTICIP_DIR_WEIGHTS
@@ -691,6 +694,16 @@ class EngineMain:
             # precursores VIVOS y su edad máxima -> se distingue "no hay
             # microestructura" de "las señales light dejaron de publicarse".
             reasons.append(f"fa({feed_age_now:.1f}s)")
+            # FIX v14.6: registrar CUALES son los precursores que SI cuentan
+            # (antes era imposible auditar por qué el conteo saltaba 3->1).
+            _cntd = [n for n, s in fresh_map.items()
+                     if n in ANTICIP_DIR_WEIGHTS
+                     and s.confidence >= self.cfg.min_signal_confidence
+                     and s.direction == d_out.direction]
+            if len(_cntd) < self.cfg.min_fresh_anticip_signals:
+                _missing = sorted(set(ANTICIP_DIR_WEIGHTS) - set(_cntd))
+                reasons.append("ant_cnt[" + ",".join(_cntd) + "]")
+                reasons.append("ant_no[" + ",".join(_missing) + "]")
             _ant_alive = [n for n in fresh_map if n in ANTICIP_DIR_WEIGHTS]
             if not _ant_alive:
                 try:
@@ -941,7 +954,7 @@ class EngineMain:
                     # cualquier señal viva con TTL largo (oi_delta vive 180s y
                     # falseaba el conteo -> cierres REVERSAL_ANT prematuros como
                     # el trade de 31s @ +0.014 USD que regaló la tendencia).
-                    fresh_map = self.bus.get_fresh(cfg.max_signal_age_sec)
+                    fresh_map = self.bus.get_fresh(max(cfg.max_signal_age_sec, cfg.fresh_gate_window_sec))  # FIX v14.6
                     opp_fresh = sum(
                         1 for name, s in fresh_map.items()
                         if s.direction == opposing
@@ -1056,7 +1069,7 @@ class EngineMain:
                     dec_dir_r = Direction.LONG if decision.action == "LONG" \
                         else (Direction.SHORT if decision.action == "SHORT" else Direction.NEUTRAL)
                     dir_with = abs(d_score) if ((d_score > 0) == (same_dir == Direction.LONG)) else 0.0
-                    fresh_map_r = self.bus.get_fresh(cfg.max_signal_age_sec)
+                    fresh_map_r = self.bus.get_fresh(max(cfg.max_signal_age_sec, cfg.fresh_gate_window_sec))  # FIX v14.6
                     ant_with = sum(1 for n, s in fresh_map_r.items()
                                    if n in ANTICIP_DIR_WEIGHTS
                                    and s.direction == same_dir
